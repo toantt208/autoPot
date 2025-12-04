@@ -18,7 +18,7 @@ import { logger } from './utils/logger.js';
 
 const ACTIVATE_BEFORE_CLOSE_SECONDS = 2; // Start 2 seconds before market end time
 
-const BET_AMOUNT = 1; // 1 USDC per trade
+const BET_AMOUNT = 30; // 1 USDC per trade
 
 interface MarketStatus {
   closed: boolean;
