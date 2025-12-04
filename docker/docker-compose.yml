@@ -1,0 +1,140 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # INFRASTRUCTURE SERVICES
+  # ============================================
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: polymarket-db
+    environment:
+      POSTGRES_DB: polymarket
+      POSTGRES_USER: polymarket
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-polymarket123}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polymarket"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - polymarket-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: polymarket-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - polymarket-net
+
+  # ============================================
+  # APPLICATION SERVICES
+  # ============================================
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    container_name: polymarket-api
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://polymarket:${DB_PASSWORD:-polymarket123}@postgres:5432/polymarket
+      - REDIS_URL=redis://redis:6379
+      - PORT=3001
+      - MASTER_PRIVATE_KEY=${MASTER_PRIVATE_KEY}
+      - GNOSIS_SAFE_ADDRESS=${GNOSIS_SAFE_ADDRESS}
+      - CLOB_API_KEY=${CLOB_API_KEY}
+      - CLOB_SECRET=${CLOB_SECRET}
+      - CLOB_PASSPHRASE=${CLOB_PASSPHRASE}
+      - POLYGON_RPC_URL=${POLYGON_RPC_URL:-https://polygon-rpc.com}
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3001/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - polymarket-net
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.scheduler
+    container_name: polymarket-scheduler
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://polymarket:${DB_PASSWORD:-polymarket123}@postgres:5432/polymarket
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - polymarket-net
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    container_name: polymarket-worker
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://polymarket:${DB_PASSWORD:-polymarket123}@postgres:5432/polymarket
+      - REDIS_URL=redis://redis:6379
+      - MASTER_PRIVATE_KEY=${MASTER_PRIVATE_KEY}
+      - GNOSIS_SAFE_ADDRESS=${GNOSIS_SAFE_ADDRESS}
+      - CLOB_API_KEY=${CLOB_API_KEY}
+      - CLOB_SECRET=${CLOB_SECRET}
+      - CLOB_PASSPHRASE=${CLOB_PASSPHRASE}
+      - POLYGON_RPC_URL=${POLYGON_RPC_URL:-https://polygon-rpc.com}
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-10}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - polymarket-net
+
+  admin:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.admin
+    container_name: polymarket-admin
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    networks:
+      - polymarket-net
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  polymarket-net:
+    driver: bridge

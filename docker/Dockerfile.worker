@@ -1,0 +1,66 @@
+# Worker Service Dockerfile
+FROM node:20-alpine AS base
+
+# Install pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+WORKDIR /app
+
+# ============================================
+# Dependencies stage
+# ============================================
+FROM base AS deps
+
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
+COPY packages/core/package.json ./packages/core/
+COPY packages/db/package.json ./packages/db/
+COPY packages/worker/package.json ./packages/worker/
+
+RUN pnpm install --frozen-lockfile
+
+# ============================================
+# Build stage
+# ============================================
+FROM base AS builder
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/packages/core/node_modules ./packages/core/node_modules
+COPY --from=deps /app/packages/db/node_modules ./packages/db/node_modules
+COPY --from=deps /app/packages/worker/node_modules ./packages/worker/node_modules
+
+COPY pnpm-workspace.yaml package.json ./
+COPY packages/core ./packages/core
+COPY packages/db ./packages/db
+COPY packages/worker ./packages/worker
+
+# Generate Prisma client
+RUN pnpm --filter @polymarket/db db:generate
+
+# Build packages
+RUN pnpm --filter @polymarket/core build
+RUN pnpm --filter @polymarket/worker build
+
+# ============================================
+# Production stage
+# ============================================
+FROM base AS runner
+
+ENV NODE_ENV=production
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nodejs
+
+WORKDIR /app
+
+COPY --from=builder --chown=nodejs:nodejs /app/packages/core/dist ./packages/core/dist
+COPY --from=builder --chown=nodejs:nodejs /app/packages/core/package.json ./packages/core/
+COPY --from=builder --chown=nodejs:nodejs /app/packages/db/dist ./packages/db/dist
+COPY --from=builder --chown=nodejs:nodejs /app/packages/db/package.json ./packages/db/
+COPY --from=builder --chown=nodejs:nodejs /app/packages/worker/dist ./packages/worker/dist
+COPY --from=builder --chown=nodejs:nodejs /app/packages/worker/package.json ./packages/worker/
+COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
+COPY --from=builder --chown=nodejs:nodejs /app/package.json ./
+
+USER nodejs
+
+CMD ["node", "packages/worker/dist/index.js"]
