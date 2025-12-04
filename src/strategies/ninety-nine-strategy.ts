@@ -1,16 +1,17 @@
 /**
  * 99% Price Strategy
  *
- * Monitors markets in the final seconds (configurable, default 10s) and:
- * 1. Buy immediately when either side reaches 99% threshold
- * 2. If no 99% found by end of window, buy whichever side is higher
+ * Flow (example: BTC 13:00 - 13:15):
+ * 1. Active Window (13:13:00 - 13:14:57): Poll for 99% threshold, buy if hit
+ * 2. Fallback Window (13:14:57 - 13:15:00): Loop buying higher side until matched
+ * 3. Retry Window (13:15:00 - 13:15:05): Keep retrying for 5 seconds after close
  */
 
 import { TradingClient } from '../clients/trading-client.js';
 import { MarketClient } from '../clients/market-client.js';
 import { logger } from '../utils/logger.js';
-import { monitorPricesUntilSignal, checkPricesOnce } from '../services/price-monitor.js';
-import { executeTrade, TradeTracker } from '../services/trade-executor.js';
+import { fetchPrices } from '../services/price-monitor.js';
+import { TradeTracker } from '../services/trade-executor.js';
 import {
   calculateMarketWindow,
   isInTradingWindow,
@@ -20,6 +21,9 @@ import {
 import type { MarketWindow, TokenIds, TradeResult } from '../types/index.js';
 import type { Config } from '../config/index.js';
 import type { EventConfig } from '../config/events.js';
+
+const FALLBACK_WINDOW_SECS = 3;  // Last 3 seconds before close
+const RETRY_AFTER_CLOSE_SECS = 5; // 5 seconds after market close
 
 /**
  * Check if we're within the market window
@@ -40,8 +44,55 @@ export interface StrategyResult {
 }
 
 /**
+ * Try to place a buy order, retry immediately on error
+ * Returns true if order was matched, false otherwise
+ */
+async function tryBuy(
+  tradingClient: TradingClient,
+  tokenId: string,
+  amount: number,
+  negRisk: boolean,
+  tickSize: string,
+  side: string,
+  slug: string
+): Promise<{ matched: boolean; orderId?: string; txHash?: string; error?: string }> {
+  try {
+    const result = await tradingClient.marketBuy({
+      tokenId,
+      amount,
+      negRisk,
+      tickSize,
+    });
+
+    logger.info(result, 'Buy order result');
+    const txHash = (result as any).transactionHash || (result as any).txHash;
+
+    logger.info(
+      { orderId: result.orderID, status: result.status, txHash, side, slug },
+      'Order placed'
+    );
+
+    // Success if we have a transaction hash
+    if (txHash) {
+      logger.info({ orderId: result.orderID, txHash, side, slug }, 'Buy success (has txHash)! Stopping.');
+      return { matched: true, orderId: result.orderID, txHash };
+    }
+
+    // Also consider DRY_RUN as success
+    if (result.status === 'DRY_RUN') {
+      return { matched: true, orderId: result.orderID };
+    }
+
+    return { matched: false, orderId: result.orderID };
+  } catch (error: any) {
+    const errorMsg = error?.message || String(error);
+    logger.warn({ error: errorMsg, side, slug }, 'Buy error, will retry');
+    return { matched: false, error: errorMsg };
+  }
+}
+
+/**
  * Execute the 99% strategy for a single market window
- * Only takes action in the final N seconds (configured via tradingWindowSeconds)
  */
 export async function executeStrategy(
   tradingClient: TradingClient,
@@ -52,6 +103,8 @@ export async function executeStrategy(
   config: Config
 ): Promise<StrategyResult> {
   const now = Math.floor(Date.now() / 1000);
+  const fallbackStart = window.marketCloseTime - FALLBACK_WINDOW_SECS;
+  const retryDeadline = window.marketCloseTime + RETRY_AFTER_CLOSE_SECS;
 
   logger.info(
     { window: formatWindowInfo(window, now), threshold: config.MIN_PRICE_THRESHOLD },
@@ -81,76 +134,150 @@ export async function executeStrategy(
     'Entering trading window'
   );
 
-  // Monitor prices until we find 99% threshold or reach end of window
-  const signal = await monitorPricesUntilSignal(
-    tradingClient,
-    tokenIds,
-    window,
-    config.MIN_PRICE_THRESHOLD,
-    window.endTime // Monitor until market closes
-  );
+  // ============================================
+  // PHASE 1: Active Window - Poll for 99% threshold
+  // ============================================
+  while (Math.floor(Date.now() / 1000) < fallbackStart) {
+    try {
+      const snapshot = await fetchPrices(tradingClient, tokenIds);
+      const { upPrice, downPrice } = snapshot;
+      const timeLeft = window.marketCloseTime - Math.floor(Date.now() / 1000);
 
-  if (signal) {
-    const tradeResult = await executeTrade(tradingClient, signal, config);
-    tradeTracker.markTraded(window.slug, tradeResult);
+      logger.info(
+        {
+          slug: window.slug,
+          up: `${(upPrice * 100).toFixed(2)}%`,
+          down: `${(downPrice * 100).toFixed(2)}%`,
+          threshold: `${(config.MIN_PRICE_THRESHOLD * 100).toFixed(0)}%`,
+          timeLeft: `${timeLeft}s`,
+        },
+        'Price check'
+      );
 
-    return {
-      marketSlug: window.slug,
-      traded: true,
-      tradeResult,
-    };
+      // Check if either side hits 99% threshold
+      let targetSide: 'UP' | 'DOWN' | null = null;
+      let targetTokenId: string | null = null;
+      let targetPrice = 0;
+
+      if (upPrice >= config.MIN_PRICE_THRESHOLD) {
+        targetSide = 'UP';
+        targetTokenId = tokenIds.up;
+        targetPrice = upPrice;
+      } else if (downPrice >= config.MIN_PRICE_THRESHOLD) {
+        targetSide = 'DOWN';
+        targetTokenId = tokenIds.down;
+        targetPrice = downPrice;
+      }
+
+      if (targetSide && targetTokenId) {
+        logger.info(
+          { side: targetSide, price: `${(targetPrice * 100).toFixed(2)}%`, slug: window.slug },
+          '99% threshold hit! Buying...'
+        );
+
+        // Try to buy once, if no match move on (will retry in next loop or Phase 2)
+        const result = await tryBuy(
+          tradingClient,
+          targetTokenId,
+          config.BET_AMOUNT_USDC,
+          tokenIds.negRisk,
+          tokenIds.tickSize,
+          targetSide,
+          window.slug
+        );
+
+        if (result.matched) {
+          const tradeResult: TradeResult = {
+            success: true,
+            orderId: result.orderId,
+            marketSlug: window.slug,
+            side: targetSide,
+          };
+          tradeTracker.markTraded(window.slug, tradeResult);
+          return { marketSlug: window.slug, traded: true, tradeResult };
+        }
+        // No match - continue to next price check or Phase 2
+      }
+    } catch (error) {
+      logger.warn({ error, slug: window.slug }, 'Error in active window, continuing...');
+    }
   }
 
-  // No 99% threshold found - buy whichever side is higher
-  const nowAfterMonitor = Math.floor(Date.now() / 1000);
-  if (nowAfterMonitor < window.endTime && !tradeTracker.hasProcessed(window.slug)) {
-    const result = await checkPricesOnce(
-      tradingClient,
-      tokenIds,
-      window.slug,
-      config.MIN_PRICE_THRESHOLD,
-      window.endTime
-    );
+  // ============================================
+  // PHASE 2: Fallback Window - Buy higher side (loop continuously)
+  // ============================================
+  logger.info({ slug: window.slug }, 'Entering fallback window (last 3 seconds)');
 
-    const { upPrice, downPrice } = result.snapshot;
-    const higherSide = upPrice >= downPrice ? 'UP' : 'DOWN';
-    const higherPrice = Math.max(upPrice, downPrice);
-    const higherTokenId = upPrice >= downPrice ? tokenIds.up : tokenIds.down;
+  while (Math.floor(Date.now() / 1000) < retryDeadline) {
+    try {
+      const snapshot = await fetchPrices(tradingClient, tokenIds);
+      const { upPrice, downPrice } = snapshot;
+      const higherSide: 'UP' | 'DOWN' = upPrice >= downPrice ? 'UP' : 'DOWN';
+      const higherTokenId = upPrice >= downPrice ? tokenIds.up : tokenIds.down;
+      const higherPrice = Math.max(upPrice, downPrice);
 
-    logger.info(
-      {
-        slug: window.slug,
-        yes: `${(upPrice * 100).toFixed(2)}%`,
-        no: `${(downPrice * 100).toFixed(2)}%`,
-        chosen: higherSide,
-      },
-      'No 99% found - buying higher side'
-    );
+      const currentTime = Math.floor(Date.now() / 1000);
+      const isAfterClose = currentTime >= window.marketCloseTime;
+      const timeInfo = isAfterClose
+        ? `+${currentTime - window.marketCloseTime}s after close`
+        : `${window.marketCloseTime - currentTime}s left`;
 
-    const fallbackSignal = {
-      side: higherSide as 'UP' | 'DOWN',
-      price: higherPrice,
-      tokenId: higherTokenId,
-      marketSlug: window.slug,
-      negRisk: tokenIds.negRisk,
-      tickSize: tokenIds.tickSize,
-      windowEndTime: window.endTime,
-    };
+      logger.info(
+        {
+          slug: window.slug,
+          up: `${(upPrice * 100).toFixed(2)}%`,
+          down: `${(downPrice * 100).toFixed(2)}%`,
+          chosen: higherSide,
+          time: timeInfo,
+          phase: isAfterClose ? 'retry' : 'fallback',
+        },
+        'Buying higher side'
+      );
 
-    const tradeResult = await executeTrade(tradingClient, fallbackSignal, config);
-    tradeTracker.markTraded(window.slug, tradeResult);
+      const result = await tryBuy(
+        tradingClient,
+        higherTokenId,
+        config.BET_AMOUNT_USDC,
+        tokenIds.negRisk,
+        tokenIds.tickSize,
+        higherSide,
+        window.slug
+      );
 
-    return {
-      marketSlug: window.slug,
-      traded: true,
-      tradeResult,
-    };
+      if (result.matched) {
+        const tradeResult: TradeResult = {
+          success: true,
+          orderId: result.orderId,
+          marketSlug: window.slug,
+          side: higherSide,
+        };
+        tradeTracker.markTraded(window.slug, tradeResult);
+        logger.info(
+          { orderId: result.orderId, side: higherSide, slug: window.slug },
+          'Trade matched!'
+        );
+        return { marketSlug: window.slug, traded: true, tradeResult };
+      }
+      // Retry immediately (no delay)
+    } catch (error) {
+      logger.warn({ error, slug: window.slug }, 'Error in fallback/retry window, continuing...');
+    }
   }
+
+  // Retry deadline reached without match
+  logger.error({ slug: window.slug }, 'Trade failed - retry deadline reached (5s after close)');
+  const failedResult: TradeResult = {
+    success: false,
+    error: 'No match within retry window',
+    marketSlug: window.slug,
+    side: 'UP',
+  };
+  tradeTracker.markTraded(window.slug, failedResult);
 
   return {
     marketSlug: window.slug,
     traded: false,
-    skipReason: 'Window ended before trade',
+    skipReason: 'No match within retry window',
   };
 }
 

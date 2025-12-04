@@ -61,14 +61,16 @@ export function calculateMarketWindow(
 ): MarketWindow {
   const intervalSeconds = eventConfig.interval * 60;
   const startTime = getCurrentMarketStartTimestamp(eventConfig.interval, now);
-  const endTime = startTime + intervalSeconds + 60; // Keep trading 1 minute after event close
+  const marketCloseTime = startTime + intervalSeconds; // Actual market close
+  const endTime = marketCloseTime + 60; // Grace period: 1 minute after market close
 
   return {
     slug: generateSlug(eventConfig.slugName, eventConfig.slugFormat, startTime),
     crypto: eventConfig.crypto.toLowerCase(),
     startTime,
+    marketCloseTime,
     endTime,
-    tradingWindowStart: endTime - eventConfig.tradingWindowSeconds,
+    tradingWindowStart: marketCloseTime - eventConfig.tradingWindowSeconds, // 2 min before MARKET CLOSE
   };
 }
 
@@ -128,14 +130,16 @@ export function getNextMarketWindow(
 ): MarketWindow {
   const intervalSeconds = eventConfig.interval * 60;
   const nextStartTime = getCurrentMarketStartTimestamp(eventConfig.interval, now) + intervalSeconds;
-  const nextEndTime = nextStartTime + intervalSeconds + 60; // Keep trading 1 minute after event close
+  const marketCloseTime = nextStartTime + intervalSeconds; // Actual market close
+  const nextEndTime = marketCloseTime + 60; // Grace period: 1 minute after market close
 
   return {
     slug: generateSlug(eventConfig.slugName, eventConfig.slugFormat, nextStartTime),
     crypto: eventConfig.crypto.toLowerCase(),
     startTime: nextStartTime,
+    marketCloseTime,
     endTime: nextEndTime,
-    tradingWindowStart: nextEndTime - eventConfig.tradingWindowSeconds,
+    tradingWindowStart: marketCloseTime - eventConfig.tradingWindowSeconds, // 2 min before MARKET CLOSE
   };
 }
 

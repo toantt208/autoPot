@@ -11,11 +11,11 @@ import { sleep } from '../utils/retry.js';
 import type { TradingSignal, TradeResult } from '../types/index.js';
 import type { Config } from '../config/index.js';
 
-const RETRY_DELAY_MS = 500;
+const RETRY_DELAY_MS = 0;
 const ORDER_POLL_INTERVAL_MS = 500;
 const RPC_POLL_INTERVAL_MS = 1000;
 const MAX_CONFIRMATION_TIMEOUT_MS = 15000; // Max 15 seconds per confirmation attempt
-const RETRY_AFTER_END_SECONDS = 15; // Continue retrying for 15 seconds after market closes
+const RETRY_AFTER_END_SECONDS = 10; // Continue retrying for 15 seconds after market closes
 
 interface ConfirmationResult {
   confirmed: boolean;

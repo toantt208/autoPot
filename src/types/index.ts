@@ -9,9 +9,11 @@ export interface MarketWindow {
   crypto: string;
   /** Unix timestamp when market starts */
   startTime: number;
-  /** Unix timestamp when market closes */
+  /** Unix timestamp when market actually closes (for trading calculations) */
+  marketCloseTime: number;
+  /** Unix timestamp for extended window end (includes grace period) */
   endTime: number;
-  /** Unix timestamp when trading window starts (T-10s) */
+  /** Unix timestamp when trading window starts (2 min before close) */
   tradingWindowStart: number;
 }
 
