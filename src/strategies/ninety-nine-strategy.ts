@@ -222,8 +222,8 @@ export async function executeStrategy(
       const higherTokenId = upPrice >= downPrice ? tokenIds.up : tokenIds.down;
       const higherPrice = Math.max(upPrice, downPrice);
 
-      // Check if higher side is > 55%
-      if (higherPrice < 0.55) {
+      // Check if higher side is > 60%
+      if (higherPrice < 0.60) {
         const currentTime = Math.floor(Date.now() / 1000);
         const timeInfo = currentTime >= window.marketCloseTime
           ? `+${currentTime - window.marketCloseTime}s after close`
