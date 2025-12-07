@@ -11,6 +11,7 @@ import { TradingClient } from '../clients/trading-client.js';
 import { MarketClient } from '../clients/market-client.js';
 import { logger } from '../utils/logger.js';
 import { fetchPrices } from '../services/price-monitor.js';
+import { sleep } from '../utils/retry.js';
 import { TradeTracker } from '../services/trade-executor.js';
 import {
   calculateMarketWindow,
@@ -196,9 +197,14 @@ export async function executeStrategy(
           return { marketSlug: window.slug, traded: true, tradeResult };
         }
         // No match - continue to next price check or Phase 2
+        if (config.IS_SERVER) await sleep(500);
+      } else {
+        // No threshold hit - add delay before next price check
+        if (config.IS_SERVER) await sleep(500);
       }
     } catch (error) {
       logger.warn({ error, slug: window.slug }, 'Error in active window, continuing...');
+      if (config.IS_SERVER) await sleep(500);
     }
   }
 
@@ -277,9 +283,11 @@ export async function executeStrategy(
         );
         return { marketSlug: window.slug, traded: true, tradeResult };
       }
-      // Retry immediately (no delay)
+      // Add delay before retry if IS_SERVER
+      if (config.IS_SERVER) await sleep(500);
     } catch (error) {
       logger.warn({ error, slug: window.slug }, 'Error in fallback/retry window, continuing...');
+      if (config.IS_SERVER) await sleep(500);
     }
   }
 

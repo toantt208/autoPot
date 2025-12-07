@@ -45,6 +45,10 @@ const configSchema = z.object({
     .string()
     .default('false')
     .transform((val) => val.toLowerCase() === 'true'),
+  IS_SERVER: z
+    .string()
+    .default('false')
+    .transform((val) => val.toLowerCase() === 'true'),
 });
 
 export type Config = z.infer<typeof configSchema>;
