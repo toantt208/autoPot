@@ -23,7 +23,7 @@ import type { MarketWindow, TokenIds, TradeResult } from '../types/index.js';
 import type { Config } from '../config/index.js';
 import type { EventConfig } from '../config/events.js';
 
-const FALLBACK_WINDOW_SECS = 3;  // Last 3 seconds before close
+const FALLBACK_WINDOW_SECS = 10;  // Last 10 seconds before close
 const RETRY_AFTER_CLOSE_SECS = 5; // 5 seconds after market close
 
 /**
@@ -135,78 +135,78 @@ export async function executeStrategy(
   );
 
   // ============================================
-  // PHASE 1: Active Window - Poll for 99% threshold
+  // PHASE 1: Active Window - Poll for 99% threshold (DISABLED)
   // ============================================
-  while (Math.floor(Date.now() / 1000) < fallbackStart) {
-    try {
-      const snapshot = await fetchPrices(tradingClient, tokenIds);
-      const { upPrice, downPrice } = snapshot;
-      const timeLeft = window.marketCloseTime - Math.floor(Date.now() / 1000);
+  // while (Math.floor(Date.now() / 1000) < fallbackStart) {
+  //   try {
+  //     const snapshot = await fetchPrices(tradingClient, tokenIds);
+  //     const { upPrice, downPrice } = snapshot;
+  //     const timeLeft = window.marketCloseTime - Math.floor(Date.now() / 1000);
 
-      logger.info(
-        {
-          slug: window.slug,
-          up: `${(upPrice * 100).toFixed(2)}%`,
-          down: `${(downPrice * 100).toFixed(2)}%`,
-          threshold: `${(config.MIN_PRICE_THRESHOLD * 100).toFixed(0)}%`,
-          timeLeft: `${timeLeft}s`,
-        },
-        'Price check'
-      );
+  //     logger.info(
+  //       {
+  //         slug: window.slug,
+  //         up: `${(upPrice * 100).toFixed(2)}%`,
+  //         down: `${(downPrice * 100).toFixed(2)}%`,
+  //         threshold: `${(config.MIN_PRICE_THRESHOLD * 100).toFixed(0)}%`,
+  //         timeLeft: `${timeLeft}s`,
+  //       },
+  //       'Price check'
+  //     );
 
-      // Check if either side hits 99% threshold
-      let targetSide: 'UP' | 'DOWN' | null = null;
-      let targetTokenId: string | null = null;
-      let targetPrice = 0;
+  //     // Check if either side hits 99% threshold
+  //     let targetSide: 'UP' | 'DOWN' | null = null;
+  //     let targetTokenId: string | null = null;
+  //     let targetPrice = 0;
 
-      if (upPrice >= config.MIN_PRICE_THRESHOLD) {
-        targetSide = 'UP';
-        targetTokenId = tokenIds.up;
-        targetPrice = upPrice;
-      } else if (downPrice >= config.MIN_PRICE_THRESHOLD) {
-        targetSide = 'DOWN';
-        targetTokenId = tokenIds.down;
-        targetPrice = downPrice;
-      }
+  //     if (upPrice >= config.MIN_PRICE_THRESHOLD) {
+  //       targetSide = 'UP';
+  //       targetTokenId = tokenIds.up;
+  //       targetPrice = upPrice;
+  //     } else if (downPrice >= config.MIN_PRICE_THRESHOLD) {
+  //       targetSide = 'DOWN';
+  //       targetTokenId = tokenIds.down;
+  //       targetPrice = downPrice;
+  //     }
 
-      if (targetSide && targetTokenId) {
-        logger.info(
-          { side: targetSide, price: `${(targetPrice * 100).toFixed(2)}%`, slug: window.slug },
-          '99% threshold hit! Buying...'
-        );
+  //     if (targetSide && targetTokenId) {
+  //       logger.info(
+  //         { side: targetSide, price: `${(targetPrice * 100).toFixed(2)}%`, slug: window.slug },
+  //         '99% threshold hit! Buying...'
+  //       );
 
-        // Try to buy once, if no match move on (will retry in next loop or Phase 2)
-        const result = await tryBuy(
-          tradingClient,
-          targetTokenId,
-          config.BET_AMOUNT_USDC,
-          tokenIds.negRisk,
-          tokenIds.tickSize,
-          targetSide,
-          window.slug
-        );
+  //       // Try to buy once, if no match move on (will retry in next loop or Phase 2)
+  //       const result = await tryBuy(
+  //         tradingClient,
+  //         targetTokenId,
+  //         config.BET_AMOUNT_USDC,
+  //         tokenIds.negRisk,
+  //         tokenIds.tickSize,
+  //         targetSide,
+  //         window.slug
+  //       );
 
-        if (result.matched) {
-          const tradeResult: TradeResult = {
-            success: true,
-            orderId: result.orderId,
-            marketSlug: window.slug,
-            side: targetSide,
-          };
-          tradeTracker.markTraded(window.slug, tradeResult);
-          return { marketSlug: window.slug, traded: true, tradeResult };
-        }
-        // No match - continue to next price check or Phase 2
-        if (config.IS_SERVER) await sleep(500);
-      } else {
-        // No threshold hit - add delay before next price check
-        if (config.IS_SERVER) await sleep(500);
-      }
-    } catch (error) {
-      logger.warn({ error, slug: window.slug }, 'Error in active window, continuing...');
-      if (config.IS_SERVER) await sleep(500);
-    }
-  }
+  //       if (result.matched) {
+  //         const tradeResult: TradeResult = {
+  //           success: true,
+  //           orderId: result.orderId,
+  //           marketSlug: window.slug,
+  //           side: targetSide,
+  //         };
+  //         tradeTracker.markTraded(window.slug, tradeResult);
+  //         return { marketSlug: window.slug, traded: true, tradeResult };
+  //       }
+  //       // No match - continue to next price check or Phase 2
+  //       if (config.IS_SERVER) await sleep(500);
+  //     } else {
+  //       // No threshold hit - add delay before next price check
+  //       if (config.IS_SERVER) await sleep(500);
+  //     }
+  //   } catch (error) {
+  //     logger.warn({ error, slug: window.slug }, 'Error in active window, continuing...');
+  //     if (config.IS_SERVER) await sleep(500);
+  //   }
+  // }
 
   // ============================================
   // PHASE 2: Fallback Window - Buy higher side (loop continuously)
