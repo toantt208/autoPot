@@ -8,10 +8,14 @@
 import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
 import type { ApiKeyCreds, TickSize } from '@polymarket/clob-client';
 import { SignatureType } from '@polymarket/order-utils';
+import { RelayClient } from '@polymarket/builder-relayer-client';
+import type { SafeTransaction } from '@polymarket/builder-relayer-client';
+import { BuilderConfig } from '@polymarket/builder-signing-sdk';
 import { Wallet } from '@ethersproject/wallet';
 import { JsonRpcProvider } from '@ethersproject/providers';
 import { Contract } from '@ethersproject/contracts';
 import type { BigNumber } from '@ethersproject/bignumber';
+import { encodeFunctionData } from 'viem';
 import { logger } from '../utils/logger.js';
 import type { Config } from '../config/index.js';
 
@@ -26,6 +30,35 @@ const CONTRACTS = {
 
 const POLYGON_CHAIN_ID = 137;
 const CLOB_HOST = 'https://clob.polymarket.com';
+const RELAYER_URL = 'https://relayer-v2.polymarket.com/';
+const MAX_UINT256 = '115792089237316195423570985008687907853269984665640564039457584007913129639935';
+
+// ABIs for encoding transaction data (viem format)
+const ERC20_APPROVE_ABI = [
+  {
+    inputs: [
+      { name: 'spender', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    name: 'approve',
+    outputs: [{ type: 'bool' }],
+    stateMutability: 'nonpayable',
+    type: 'function',
+  },
+] as const;
+
+const ERC1155_SET_APPROVAL_ABI = [
+  {
+    inputs: [
+      { name: 'operator', type: 'address' },
+      { name: 'approved', type: 'bool' },
+    ],
+    name: 'setApprovalForAll',
+    outputs: [],
+    stateMutability: 'nonpayable',
+    type: 'function',
+  },
+] as const;
 
 // Minimal ABIs for allowance checks
 const ERC20_ABI = [
@@ -58,11 +91,11 @@ export interface AllowanceStatus {
 
 export class TradingClient {
   private client: ClobClient;
+  private relayClient: RelayClient;
   private provider: JsonRpcProvider;
   private proxyAddress: string;
   private wallet: Wallet;
   private dryRun: boolean;
-
 
   constructor(config: Config) {
     this.provider = new JsonRpcProvider(config.POLYGON_RPC_URL);
@@ -86,6 +119,22 @@ export class TradingClient {
       creds,
       SignatureType.POLY_GNOSIS_SAFE,
       config.GNOSIS_SAFE_ADDRESS
+    );
+
+    // Initialize Builder Relayer client for gasless transactions
+    const builderConfig = new BuilderConfig({
+      localBuilderCreds: {
+        key: config.BUILDER_API_KEY,
+        secret: config.BUILDER_SECRET,
+        passphrase: config.BUILDER_PASSPHRASE,
+      },
+    });
+
+    this.relayClient = new RelayClient(
+      RELAYER_URL,
+      POLYGON_CHAIN_ID,
+      this.wallet,
+      builderConfig
     );
 
     logger.info(
@@ -114,6 +163,39 @@ export class TradingClient {
     } catch (error: any) {
       logger.warn({ tokenId: tokenId.slice(0, 20) + '...', error: error?.message }, 'Error fetching price');
       return 0;
+    }
+  }
+
+  /**
+   * Get batch prices for multiple tokens in one API call
+   * Uses POST /prices endpoint to avoid rate limiting
+   */
+  async getBatchPrices(upTokenId: string, downTokenId: string): Promise<{ upPrice: number; downPrice: number }> {
+    try {
+      const response = await fetch('https://clob.polymarket.com/prices', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([
+          { token_id: upTokenId, side: 'BUY' },
+          { token_id: downTokenId, side: 'BUY' },
+        ]),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      console.log(data);
+      // Response format: { "token_id": { "BUY": "0.7", "SELL": "0.8" }, ... }
+      const upPrice = parseFloat(data[upTokenId]?.BUY || '0');
+      const downPrice = parseFloat(data[downTokenId]?.BUY || '0');
+
+      logger.debug({ upPrice, downPrice }, 'Batch prices fetched');
+      return { upPrice, downPrice };
+    } catch (error: any) {
+      logger.warn({ error: error?.message }, 'Error fetching batch prices');
+      return { upPrice: 0, downPrice: 0 };
     }
   }
 
@@ -281,5 +363,105 @@ export class TradingClient {
    */
   getProvider(): JsonRpcProvider {
     return this.provider;
+  }
+
+  /**
+   * Get the wallet for direct signing
+   */
+  getWallet(): Wallet {
+    return this.wallet;
+  }
+
+  /**
+   * Build all approval transactions for trading
+   * USDC approvals + CTF (ERC1155) approvals to all required contracts
+   */
+  private buildAllApprovalTxs(): SafeTransaction[] {
+    const transactions: SafeTransaction[] = [];
+
+    // USDC approvals (ERC20)
+    const usdcSpenders = [
+      CONTRACTS.CTF_EXCHANGE,
+      CONTRACTS.NEG_RISK_CTF_EXCHANGE,
+      CONTRACTS.NEG_RISK_ADAPTER,
+    ];
+
+    for (const spender of usdcSpenders) {
+      const data = encodeFunctionData({
+        abi: ERC20_APPROVE_ABI,
+        functionName: 'approve',
+        args: [spender as `0x${string}`, BigInt(MAX_UINT256)],
+      });
+
+      transactions.push({
+        to: CONTRACTS.USDC,
+        operation: 0, // Call
+        value: '0',
+        data,
+      });
+    }
+
+    // CTF approvals (ERC1155)
+    const ctfOperators = [
+      CONTRACTS.CTF_EXCHANGE,
+      CONTRACTS.NEG_RISK_CTF_EXCHANGE,
+      CONTRACTS.NEG_RISK_ADAPTER,
+    ];
+
+    for (const operator of ctfOperators) {
+      const data = encodeFunctionData({
+        abi: ERC1155_SET_APPROVAL_ABI,
+        functionName: 'setApprovalForAll',
+        args: [operator as `0x${string}`, true],
+      });
+
+      transactions.push({
+        to: CONTRACTS.CONDITIONAL_TOKENS,
+        operation: 0, // Call
+        value: '0',
+        data,
+      });
+    }
+
+    return transactions;
+  }
+
+  /**
+   * Approve all tokens for trading via Builder Relayer (gasless)
+   * Approves USDC and CTF to all required Polymarket contracts
+   * Returns transaction hash
+   */
+  async approveAll(): Promise<{ txHash: string; success: boolean }> {
+    logger.info({ safeAddress: this.proxyAddress }, 'Starting gasless approval via relayer...');
+
+    const transactions = this.buildAllApprovalTxs();
+    logger.info({ txCount: transactions.length }, 'Built approval transactions');
+
+    try {
+      // Execute via relayer (gasless - relayer pays gas)
+      const response = await this.relayClient.execute(transactions, 'Approve all tokens for trading');
+      const txHash = (response as any).transactionHash || '';
+
+      logger.info({ txHash }, 'Approval transaction sent via relayer');
+
+      // Wait for confirmation
+      if (txHash) {
+        logger.info('Waiting for transaction confirmation...');
+        const receipt = await this.provider.waitForTransaction(txHash);
+        logger.info({ txHash, blockNumber: receipt.blockNumber }, 'Approval transaction confirmed');
+      }
+
+      return { txHash, success: true };
+    } catch (error: any) {
+      logger.error({ error: error?.message }, 'Failed to execute approvals via relayer');
+      return { txHash: '', success: false };
+    }
+  }
+
+  /**
+   * Get contract addresses (for logging/debugging)
+   */
+  static getContracts() {
+    return CONTRACTS;
   }
 }

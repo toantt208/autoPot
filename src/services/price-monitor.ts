@@ -22,16 +22,14 @@ export interface PriceCheckResult {
 
 /**
  * Fetch current prices for both Up and Down outcomes
+ * Uses batch API to avoid rate limiting
  * Saves to Redis for post-buy fallback
  */
 export async function fetchPrices(
   tradingClient: TradingClient,
   tokenIds: TokenIds
 ): Promise<PriceSnapshot> {
-  const [upPrice, downPrice] = await Promise.all([
-    tradingClient.getBuyPrice(tokenIds.up),
-    tradingClient.getBuyPrice(tokenIds.down),
-  ]);
+  const { upPrice, downPrice } = await tradingClient.getBatchPrices(tokenIds.up, tokenIds.down);
 
   // Cache prices to Redis if tokenIds provided and prices are valid
   if (upPrice > 0 || downPrice > 0) {

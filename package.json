@@ -16,7 +16,8 @@
     "db:migrate": "pnpm --filter @polymarket/db db:migrate",
     "legacy:build": "tsup",
     "legacy:start": "node dist/index.js",
-    "legacy:redeem": "node dist/redeem.js"
+    "legacy:redeem": "node dist/redeem.js",
+    "legacy:approve": "node dist/approve-all.js"
   },
   "dependencies": {
     "@ethersproject/abi": "^5.7.0",

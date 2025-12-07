@@ -34,6 +34,8 @@ async function main() {
   // Load config
   const config = getConfig();
 
+  console.log({ config })
+
   if (config.DRY_RUN) {
     logger.warn('DRY RUN MODE - No real trades will be executed');
   }
@@ -68,6 +70,19 @@ async function main() {
     'Current prices'
   );
 
+  // Check sum threshold before buying
+  const sumPrice = upPrice + downPrice;
+  if (sumPrice < price) {
+    logger.warn(
+      {
+        sum: `${(sumPrice * 100).toFixed(2)}%`,
+        threshold: `${(price * 100).toFixed(2)}%`,
+      },
+      'Sum of prices below threshold, skipping'
+    );
+    return;
+  }
+
   // Determine higher side
   const higherSide = upPrice >= downPrice ? 'UP' : 'DOWN';
   const higherTokenId = upPrice >= downPrice ? tokenIds.up : tokenIds.down;
@@ -100,7 +115,10 @@ async function main() {
       },
       'Order placed successfully'
     );
+
+    console.log(result);
   } catch (error: any) {
+    console.error(error);
     logger.error({ error: error?.message || error }, 'Failed to place order');
     process.exit(1);
   }

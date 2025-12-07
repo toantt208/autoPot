@@ -65,8 +65,7 @@ async function tryBuy(
     });
 
     logger.info(result, 'Buy order result');
-    const txHash = (result as any).transactionHash || (result as any).txHash;
-
+    const txHash = result?.transactionHashes[0]
     logger.info(
       { orderId: result.orderID, status: result.status, txHash, side, slug },
       'Order placed'
@@ -212,9 +211,29 @@ export async function executeStrategy(
     try {
       const snapshot = await fetchPrices(tradingClient, tokenIds);
       const { upPrice, downPrice } = snapshot;
+
       const higherSide: 'UP' | 'DOWN' = upPrice >= downPrice ? 'UP' : 'DOWN';
       const higherTokenId = upPrice >= downPrice ? tokenIds.up : tokenIds.down;
       const higherPrice = Math.max(upPrice, downPrice);
+
+      // Check if higher side is > 55%
+      if (higherPrice < 0.55) {
+        const currentTime = Math.floor(Date.now() / 1000);
+        const timeInfo = currentTime >= window.marketCloseTime
+          ? `+${currentTime - window.marketCloseTime}s after close`
+          : `${window.marketCloseTime - currentTime}s left`;
+
+        logger.info(
+          {
+            slug: window.slug,
+            higherSide,
+            higherPrice: `${(higherPrice * 100).toFixed(2)}%`,
+            time: timeInfo,
+          },
+          'Higher side below 55%, skipping'
+        );
+        continue;
+      }
 
       const currentTime = Math.floor(Date.now() / 1000);
       const isAfterClose = currentTime >= window.marketCloseTime;

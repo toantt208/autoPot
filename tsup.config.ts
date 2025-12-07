@@ -6,6 +6,7 @@ export default defineConfig({
     'src/redeem.ts',
     'src/buy.ts',
     'src/post-buy.ts',
+    'src/approve-all.ts',
   ],
   format: ['esm'],
   dts: true,
