@@ -1,0 +1,119 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===========================================
+// STATS TABLES
+// ===========================================
+
+model StatsWindow {
+  id              BigInt   @id @default(autoincrement())
+  marketSlug      String   @unique @map("market_slug") @db.VarChar(100)
+  eventSlug       String   @map("event_slug") @db.VarChar(20)
+  crypto          String   @db.VarChar(10)
+  interval        String   @db.VarChar(10)
+  startTime       DateTime @map("start_time") @db.Timestamptz
+  endTime         DateTime @map("end_time") @db.Timestamptz
+  sideFlips       Int      @default(0) @map("side_flips")
+  flipsAt98       Int      @default(0) @map("flips_at_98")
+  phase1FinalSide String?  @map("phase1_final_side") @db.VarChar(4)
+  phase2FinalSide String?  @map("phase2_final_side") @db.VarChar(4)
+  finalSide       String?  @map("final_side") @db.VarChar(4)
+  wouldHaveWon    Boolean? @map("would_have_won")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  snapshots      StatsPriceSnapshot[]
+  flips          StatsSideFlip[]
+  simulatedTrade StatsSimulatedTrade?
+
+  @@index([eventSlug])
+  @@index([crypto])
+  @@index([startTime(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+  @@map("stats_windows")
+}
+
+model StatsPriceSnapshot {
+  id         BigInt   @id @default(autoincrement())
+  windowId   BigInt   @map("window_id")
+  timestamp  DateTime @db.Timestamptz
+  timeLeft   Int      @map("time_left")
+  upPrice    Decimal  @map("up_price") @db.Decimal(5, 4)
+  downPrice  Decimal  @map("down_price") @db.Decimal(5, 4)
+  higherSide String   @map("higher_side") @db.VarChar(4)
+  phase      String   @db.VarChar(10)
+
+  window StatsWindow @relation(fields: [windowId], references: [id], onDelete: Cascade)
+
+  @@index([windowId])
+  @@index([timestamp(sort: Desc)])
+  @@index([phase])
+  @@map("stats_price_snapshots")
+}
+
+model StatsSideFlip {
+  id          BigInt   @id @default(autoincrement())
+  windowId    BigInt   @map("window_id")
+  timestamp   DateTime @db.Timestamptz
+  timeLeft    Int      @map("time_left")
+  fromSide    String   @map("from_side") @db.VarChar(4)
+  toSide      String   @map("to_side") @db.VarChar(4)
+  priceAtFlip Decimal  @map("price_at_flip") @db.Decimal(5, 4)
+  wasAt98     Boolean  @default(false) @map("was_at_98")
+
+  window StatsWindow @relation(fields: [windowId], references: [id], onDelete: Cascade)
+
+  @@index([windowId])
+  @@index([timestamp(sort: Desc)])
+  @@map("stats_side_flips")
+}
+
+model StatsSession {
+  id                BigInt    @id @default(autoincrement())
+  crypto            String    @db.VarChar(10)
+  interval          String    @db.VarChar(10)
+  startedAt         DateTime  @map("started_at") @db.Timestamptz
+  endedAt           DateTime? @map("ended_at") @db.Timestamptz
+  totalWindows      Int       @default(0) @map("total_windows")
+  totalFlips        Int       @default(0) @map("total_flips")
+  avgFlipsPerWindow Decimal   @default(0) @map("avg_flips_per_window") @db.Decimal(5, 2)
+  wins              Int       @default(0)
+  losses            Int       @default(0)
+  winRate           Decimal   @default(0) @map("win_rate") @db.Decimal(5, 4)
+
+  @@index([crypto])
+  @@index([startedAt(sort: Desc)])
+  @@map("stats_sessions")
+}
+
+// Simulated trade: buy higher side at phase 1 start when >= 60%
+model StatsSimulatedTrade {
+  id            BigInt   @id @default(autoincrement())
+  windowId      BigInt   @unique @map("window_id")
+  marketSlug    String   @map("market_slug") @db.VarChar(100)
+  eventSlug     String   @map("event_slug") @db.VarChar(20)
+  crypto        String   @db.VarChar(10)
+  side          String   @db.VarChar(4)                          // UP or DOWN
+  entryPrice    Decimal  @map("entry_price") @db.Decimal(5, 4)   // Price when bought (e.g., 0.62)
+  exitPrice     Decimal  @map("exit_price") @db.Decimal(5, 4)    // Final price (1.0 win, 0.0 lose)
+  won           Boolean                                           // Did the trade win?
+  profitPercent Decimal  @map("profit_percent") @db.Decimal(6, 2) // Profit/loss % (e.g., +38 or -62)
+  amount        Decimal  @default(10) @db.Decimal(10, 2)          // Bet amount in USD (default $10)
+  shares        Decimal  @db.Decimal(10, 4)                       // Shares bought = amount / entryPrice
+  payout        Decimal  @db.Decimal(10, 2)                       // Payout = shares * 1 if win, 0 if lose
+  profitUsd     Decimal  @map("profit_usd") @db.Decimal(10, 2)    // Profit/loss in USD
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  window StatsWindow @relation(fields: [windowId], references: [id], onDelete: Cascade)
+
+  @@index([eventSlug])
+  @@index([crypto])
+  @@index([won])
+  @@index([createdAt(sort: Desc)])
+  @@map("stats_simulated_trades")
+}

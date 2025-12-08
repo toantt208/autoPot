@@ -4,27 +4,47 @@ module.exports = {
     {
       name: 'polymarket-redeem',
       script: 'dist/redeem.js',
+      output: './logs/redeem-out.log',
+      error: './logs/redeem-error.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      time: true,
     },
     // 15-minute markets
     {
       name: 'polymarket-btc-15m',
       script: 'dist/index.js',
       args: 'btc_15m',
+      output: './logs/btc-15m-out.log',
+      error: './logs/btc-15m-error.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      time: true,
     },
     {
       name: 'polymarket-eth-15m',
       script: 'dist/index.js',
       args: 'eth_15m',
+      output: './logs/eth-15m-out.log',
+      error: './logs/eth-15m-error.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      time: true,
     },
     {
       name: 'polymarket-sol-15m',
       script: 'dist/index.js',
       args: 'sol_15m',
+      output: './logs/sol-15m-out.log',
+      error: './logs/sol-15m-error.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      time: true,
     },
     {
       name: 'polymarket-xrp-15m',
       script: 'dist/index.js',
       args: 'xrp_15m',
+      output: './logs/xrp-15m-out.log',
+      error: './logs/xrp-15m-error.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      time: true,
     },
     // 1-hour markets
     // {

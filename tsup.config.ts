@@ -7,6 +7,8 @@ export default defineConfig({
     'src/buy.ts',
     'src/post-buy.ts',
     'src/approve-all.ts',
+    'src/stats.ts',
+    'src/stats-view.ts',
   ],
   format: ['esm'],
   dts: true,

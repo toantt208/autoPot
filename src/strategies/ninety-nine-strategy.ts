@@ -66,7 +66,7 @@ async function tryBuy(
     });
 
     logger.info(result, 'Buy order result');
-    const txHash = result?.transactionHashes[0]
+    const txHash = result?.transactionHashes?.[0];
     logger.info(
       { orderId: result.orderID, status: result.status, txHash, side, slug },
       'Order placed'

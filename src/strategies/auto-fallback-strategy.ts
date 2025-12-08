@@ -3,13 +3,14 @@
  *
  * Flow (example: BTC 13:00 - 13:15):
  * 1. Trading Window: Enter in the final window
- * 2. Auto Fallback: Buy the higher side ONCE and stop
+ * 2. Auto Fallback: Buy the higher side, retry until matched or deadline
  */
 
 import { TradingClient } from '../clients/trading-client.js';
 import { MarketClient } from '../clients/market-client.js';
 import { logger } from '../utils/logger.js';
 import { fetchPrices } from '../services/price-monitor.js';
+import { sleep } from '../utils/retry.js';
 import { TradeTracker } from '../services/trade-executor.js';
 import {
   calculateMarketWindow,
@@ -20,6 +21,8 @@ import {
 import type { MarketWindow, TokenIds, TradeResult } from '../types/index.js';
 import type { Config } from '../config/index.js';
 import type { EventConfig } from '../config/events.js';
+
+const RETRY_AFTER_CLOSE_SECS = 5; // 5 seconds after market close
 
 /**
  * Check if we're within the market window
@@ -61,7 +64,7 @@ async function tryBuy(
     });
 
     logger.info(result, 'Buy order result');
-    const txHash = result?.transactionHashes[0]
+    const txHash = result?.transactionHashes?.[0];
     logger.info(
       { orderId: result.orderID, status: result.status, txHash, side, slug },
       'Order placed'
@@ -88,7 +91,7 @@ async function tryBuy(
 
 /**
  * Execute the auto fallback strategy for a single market window
- * Simply buys the higher side ONCE and stops
+ * Buys the higher side, retries until matched or deadline (5s after close)
  */
 export async function executeAutoFallbackStrategy(
   tradingClient: TradingClient,
@@ -99,6 +102,7 @@ export async function executeAutoFallbackStrategy(
   config: Config
 ): Promise<StrategyResult> {
   const now = Math.floor(Date.now() / 1000);
+  const retryDeadline = window.marketCloseTime + RETRY_AFTER_CLOSE_SECS;
 
   logger.info(
     { window: formatWindowInfo(window, now), strategy: 'auto-fallback' },
@@ -129,99 +133,100 @@ export async function executeAutoFallbackStrategy(
   );
 
   // ============================================
-  // Auto Fallback: Buy higher side ONCE and stop
+  // Auto Fallback: Buy higher side with retry loop
   // ============================================
-  logger.info({ slug: window.slug }, 'Auto fallback mode - buying higher side once');
+  logger.info({ slug: window.slug }, 'Auto fallback mode - buying higher side (with retry)');
 
-  try {
-    const snapshot = await fetchPrices(tradingClient, tokenIds);
-    const { upPrice, downPrice } = snapshot;
+  while (Math.floor(Date.now() / 1000) < retryDeadline) {
+    try {
+      const snapshot = await fetchPrices(tradingClient, tokenIds);
+      const { upPrice, downPrice } = snapshot;
 
-    const higherSide: 'UP' | 'DOWN' = upPrice >= downPrice ? 'UP' : 'DOWN';
-    const higherTokenId = upPrice >= downPrice ? tokenIds.up : tokenIds.down;
-    const higherPrice = Math.max(upPrice, downPrice);
+      const higherSide: 'UP' | 'DOWN' = upPrice >= downPrice ? 'UP' : 'DOWN';
+      const higherTokenId = upPrice >= downPrice ? tokenIds.up : tokenIds.down;
+      const higherPrice = Math.max(upPrice, downPrice);
 
-    const currentTime = Math.floor(Date.now() / 1000);
-    const timeInfo = `${window.marketCloseTime - currentTime}s left`;
+      const currentTime = Math.floor(Date.now() / 1000);
+      const isAfterClose = currentTime >= window.marketCloseTime;
+      const timeInfo = isAfterClose
+        ? `+${currentTime - window.marketCloseTime}s after close`
+        : `${window.marketCloseTime - currentTime}s left`;
 
-    // Check if higher side is > 60%
-    if (higherPrice < 0.60) {
+      // Check if higher side is > 60%
+      if (higherPrice < 0.60) {
+        logger.info(
+          {
+            slug: window.slug,
+            higherSide,
+            higherPrice: `${(higherPrice * 100).toFixed(2)}%`,
+            time: timeInfo,
+          },
+          'Higher side below 60%, skipping'
+        );
+        if (config.IS_SERVER) await sleep(500);
+        continue;
+      }
+
       logger.info(
         {
           slug: window.slug,
-          higherSide,
-          higherPrice: `${(higherPrice * 100).toFixed(2)}%`,
+          up: `${(upPrice * 100).toFixed(2)}%`,
+          down: `${(downPrice * 100).toFixed(2)}%`,
+          chosen: higherSide,
           time: timeInfo,
+          phase: isAfterClose ? 'retry' : 'fallback',
         },
-        'Higher side below 60%, skipping trade'
+        'Buying higher side'
       );
-      tradeTracker.markSkipped(window.slug);
-      return {
-        marketSlug: window.slug,
-        traded: false,
-        skipReason: 'Higher side below 60%',
-      };
-    }
 
-    logger.info(
-      {
-        slug: window.slug,
-        up: `${(upPrice * 100).toFixed(2)}%`,
-        down: `${(downPrice * 100).toFixed(2)}%`,
-        chosen: higherSide,
-        time: timeInfo,
-      },
-      'Buying higher side'
-    );
-
-    const result = await tryBuy(
-      tradingClient,
-      higherTokenId,
-      config.BET_AMOUNT_USDC,
-      tokenIds.negRisk,
-      tokenIds.tickSize,
-      higherSide,
-      window.slug
-    );
-
-    const tradeResult: TradeResult = {
-      success: !!result.orderId,
-      orderId: result.orderId,
-      marketSlug: window.slug,
-      side: higherSide,
-      error: result.error,
-    };
-    tradeTracker.markTraded(window.slug, tradeResult);
-
-    if (result.orderId) {
-      logger.info(
-        { orderId: result.orderId, side: higherSide, slug: window.slug },
-        'Trade placed! Stopping.'
+      const result = await tryBuy(
+        tradingClient,
+        higherTokenId,
+        config.BET_AMOUNT_USDC,
+        tokenIds.negRisk,
+        tokenIds.tickSize,
+        higherSide,
+        window.slug
       );
-      return { marketSlug: window.slug, traded: true, tradeResult };
-    }
 
-    logger.warn({ slug: window.slug, error: result.error }, 'Trade failed');
-    return {
-      marketSlug: window.slug,
-      traded: false,
-      skipReason: result.error || 'Trade failed',
-    };
-  } catch (error) {
-    logger.error({ error, slug: window.slug }, 'Error in auto-fallback');
-    const failedResult: TradeResult = {
-      success: false,
-      error: String(error),
-      marketSlug: window.slug,
-      side: 'UP',
-    };
-    tradeTracker.markTraded(window.slug, failedResult);
-    return {
-      marketSlug: window.slug,
-      traded: false,
-      skipReason: String(error),
-    };
+      if (result.matched) {
+        const tradeResult: TradeResult = {
+          success: true,
+          orderId: result.orderId,
+          marketSlug: window.slug,
+          side: higherSide,
+        };
+        tradeTracker.markTraded(window.slug, tradeResult);
+        logger.info(
+          { orderId: result.orderId, side: higherSide, slug: window.slug },
+          'Trade matched! Stopping.'
+        );
+        return { marketSlug: window.slug, traded: true, tradeResult };
+      }
+
+      // No match - retry after delay
+      if (config.IS_SERVER) await sleep(500);
+    } catch (error) {
+      logger.warn({ error, slug: window.slug }, 'Error in auto-fallback, retrying...');
+      if (config.IS_SERVER) await sleep(500);
+    }
   }
+
+  // Retry deadline reached without match
+  logger.error({ slug: window.slug }, 'Trade failed - retry deadline reached (5s after close)');
+  const failedResult: TradeResult = {
+    success: false,
+    error: 'No match within retry window',
+    marketSlug: window.slug,
+    side: 'UP',
+  };
+  tradeTracker.markTraded(window.slug, failedResult);
+
+  return {
+    marketSlug: window.slug,
+    traded: false,
+    skipReason: 'No match within retry window',
+  };
 }
 
 /**
