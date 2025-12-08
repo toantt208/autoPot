@@ -9,7 +9,10 @@ import type { EventConfig } from './config/events.js';
 import { TradingClient } from './clients/trading-client.js';
 import { MarketClient } from './clients/market-client.js';
 import { TradeTracker } from './services/trade-executor.js';
+import { processMarketAutoFallback } from './strategies/auto-fallback-strategy.js';
 import { processMarket } from './strategies/ninety-nine-strategy.js';
+
+export type StrategyType = 'fallback' | 'ninetynine';
 import {
   calculateMarketWindow,
   getSecondsUntilTradingWindow,
@@ -25,16 +28,19 @@ const CLEANUP_INTERVAL_MS = 3600 * 1000; // Cleanup every hour
 export interface BotOptions {
   /** Event configuration */
   eventConfig: EventConfig;
+  /** Strategy to use (default: fallback) */
+  strategy?: StrategyType;
 }
 
 /**
  * Run the trading bot for a single event
  */
 export async function runBot(options: BotOptions): Promise<void> {
-  const { eventConfig } = options;
+  const { eventConfig, strategy = 'fallback' } = options;
   const cryptoUpper = eventConfig.crypto.toUpperCase();
 
-  logger.info({ crypto: cryptoUpper, interval: eventConfig.interval }, `Starting Polymarket ${cryptoUpper} Trading Bot`);
+  const strategyName = strategy === 'ninetynine' ? '99% Strategy' : 'Auto Fallback';
+  logger.info({ crypto: cryptoUpper, interval: eventConfig.interval, strategy: strategyName }, `Starting Polymarket ${cryptoUpper} Trading Bot`);
 
   // Load and validate configuration
   let config: Config;
@@ -115,7 +121,9 @@ export async function runBot(options: BotOptions): Promise<void> {
 
   while (!isShuttingDown) {
     try {
-      const result = await processMarket(
+      // Use selected strategy
+      const processStrategy = strategy === 'ninetynine' ? processMarket : processMarketAutoFallback;
+      const result = await processStrategy(
         eventConfig,
         tradingClient,
         marketClient,
