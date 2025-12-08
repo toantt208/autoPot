@@ -14,6 +14,7 @@ build/
 
 # Environment
 .env
+.env.99
 .env.local
 .env.*.local
 .env.production
