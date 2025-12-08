@@ -269,7 +269,7 @@ export async function executeStrategy(
         window.slug
       );
 
-      if (result.matched) {
+      if (result.orderId) {
         const tradeResult: TradeResult = {
           success: true,
           orderId: result.orderId,

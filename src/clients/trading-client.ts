@@ -291,6 +291,7 @@ export class TradingClient {
       { orderId: result.orderID, status: result.status },
       'Market buy order placed'
     );
+    console.log(result)
 
     return result;
   }
