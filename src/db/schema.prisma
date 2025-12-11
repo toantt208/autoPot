@@ -25,6 +25,9 @@ model StatsWindow {
   phase2FinalSide String?  @map("phase2_final_side") @db.VarChar(4)
   finalSide       String?  @map("final_side") @db.VarChar(4)
   wouldHaveWon    Boolean? @map("would_have_won")
+  beatPrice       Decimal? @map("beat_price") @db.Decimal(20, 8)    // Chainlink openPrice at window start
+  finalPrice      Decimal? @map("final_price") @db.Decimal(20, 8)   // Chainlink closePrice at window end
+  priceChange     Decimal? @map("price_change") @db.Decimal(10, 4)  // % change
   createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
 
   snapshots      StatsPriceSnapshot[]
@@ -47,6 +50,8 @@ model StatsPriceSnapshot {
   downPrice  Decimal  @map("down_price") @db.Decimal(5, 4)
   higherSide String   @map("higher_side") @db.VarChar(4)
   phase      String   @db.VarChar(10)
+  tokenPrice Decimal? @map("token_price") @db.Decimal(20, 8) // Real-time Chainlink price from RTDS
+  beatPrice  Decimal? @map("beat_price") @db.Decimal(20, 8)  // Chainlink openPrice (beat price) for reference
 
   window StatsWindow @relation(fields: [windowId], references: [id], onDelete: Cascade)
 
@@ -116,4 +121,56 @@ model StatsSimulatedTrade {
   @@index([won])
   @@index([createdAt(sort: Desc)])
   @@map("stats_simulated_trades")
+}
+
+// ===========================================
+// MARTINGALE STATE
+// ===========================================
+
+// Persistent state for Martingale strategy per crypto
+model MartingaleState {
+  id           BigInt   @id @default(autoincrement())
+  crypto       String   @db.VarChar(10)
+  interval     String   @db.VarChar(10)
+  targetSide   String   @map("target_side") @db.VarChar(4)  // UP or DOWN
+  baseBet      Decimal  @map("base_bet") @db.Decimal(10, 2)
+  currentBet   Decimal  @map("current_bet") @db.Decimal(10, 2)
+  totalProfit  Decimal  @default(0) @map("total_profit") @db.Decimal(10, 2)
+  wins         Int      @default(0)
+  losses       Int      @default(0)
+  currentStreak Int     @default(0) @map("current_streak")  // Current loss streak
+  maxStreak    Int      @default(0) @map("max_streak")      // Max loss streak ever
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  trades MartingaleTrade[]
+
+  @@unique([crypto, interval, targetSide])
+  @@index([crypto])
+  @@map("martingale_states")
+}
+
+// Individual Martingale trades
+model MartingaleTrade {
+  id          BigInt   @id @default(autoincrement())
+  stateId     BigInt   @map("state_id")
+  marketSlug  String   @map("market_slug") @db.VarChar(100)
+  crypto      String   @db.VarChar(10)
+  targetSide  String   @map("target_side") @db.VarChar(4)
+  betAmount   Decimal  @map("bet_amount") @db.Decimal(10, 2)
+  entryPrice  Decimal  @map("entry_price") @db.Decimal(5, 4)
+  finalSide   String?  @map("final_side") @db.VarChar(4)    // Filled after resolution
+  won         Boolean?                                       // Filled after resolution
+  profitUsd   Decimal? @map("profit_usd") @db.Decimal(10, 2) // Filled after resolution
+  orderId     String?  @map("order_id") @db.VarChar(100)
+  resolved    Boolean  @default(false)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  resolvedAt  DateTime? @map("resolved_at") @db.Timestamptz
+
+  state MartingaleState @relation(fields: [stateId], references: [id], onDelete: Cascade)
+
+  @@unique([marketSlug])
+  @@index([stateId])
+  @@index([resolved])
+  @@index([createdAt(sort: Desc)])
+  @@map("martingale_trades")
 }

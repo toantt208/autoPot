@@ -1,0 +1,13 @@
+{
+  "apps": [
+    {
+      "name": "polymarket-xrp-15m-higherside",
+      "script": "dist/index.js",
+      "args": "xrp_15m higherside",
+      "out_file": "./logs/xrp-15m-higherside-out.log",
+      "error_file": "./logs/xrp-15m-higherside-error.log",
+      "log_date_format": "YYYY-MM-DD HH:mm:ss",
+      "time": true
+    }
+  ]
+}

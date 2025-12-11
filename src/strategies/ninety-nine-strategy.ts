@@ -23,7 +23,7 @@ import type { MarketWindow, TokenIds, TradeResult } from '../types/index.js';
 import type { Config } from '../config/index.js';
 import type { EventConfig } from '../config/events.js';
 
-const FALLBACK_WINDOW_SECS = 10;  // Last 10 seconds before close
+const FALLBACK_WINDOW_SECS = 5;   // Last 5 seconds before close
 const RETRY_AFTER_CLOSE_SECS = 5; // 5 seconds after market close
 
 /**
@@ -66,7 +66,7 @@ async function tryBuy(
     });
 
     logger.info(result, 'Buy order result');
-    const txHash = result?.transactionHashes?.[0];
+    const txHash = result?.transactionsHashes?.[0];
     logger.info(
       { orderId: result.orderID, status: result.status, txHash, side, slug },
       'Order placed'
@@ -211,7 +211,7 @@ export async function executeStrategy(
   // ============================================
   // PHASE 2: Fallback Window - Buy higher side (loop continuously)
   // ============================================
-  logger.info({ slug: window.slug }, 'Entering fallback window (last 3 seconds)');
+  logger.info({ slug: window.slug }, 'Entering fallback window (last 5 seconds)');
 
   while (Math.floor(Date.now() / 1000) < retryDeadline) {
     try {

@@ -51,9 +51,32 @@ const configSchema = z.object({
     .transform((val) => val.toLowerCase() === 'true'),
 });
 
+// Stats-only config (no trading credentials required)
+const statsConfigSchema = z.object({
+  // CLOB API Credentials (read-only access for prices)
+  CLOB_API_KEY: z.string().default(''),
+  CLOB_SECRET: z.string().default(''),
+  CLOB_PASSPHRASE: z.string().default(''),
+
+  // Target Markets
+  TARGET_CRYPTOS: z.string().default('btc,eth,sol'),
+
+  // Timing Configuration (in seconds)
+  TRADING_WINDOW_SECONDS: z.coerce.number().int().positive().default(10),
+  TRADING_WINDOWS: z.string().optional(),
+
+  // RPC
+  POLYGON_RPC_URL: z.string().url().default('https://polygon-rpc.com'),
+
+  // Bot behavior
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+});
+
 export type Config = z.infer<typeof configSchema>;
+export type StatsConfig = z.infer<typeof statsConfigSchema>;
 
 let cachedConfig: Config | null = null;
+let cachedStatsConfig: StatsConfig | null = null;
 
 /**
  * Get validated configuration from environment variables
@@ -73,6 +96,28 @@ export function getConfig(): Config {
         (issue) => `  - ${issue.path.join('.')}: ${issue.message}`
       );
       throw new Error(`Configuration validation failed:\n${issues.join('\n')}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Get stats-only configuration (no trading credentials required)
+ */
+export function getStatsConfig(): StatsConfig {
+  if (cachedStatsConfig) {
+    return cachedStatsConfig;
+  }
+
+  try {
+    cachedStatsConfig = statsConfigSchema.parse(process.env);
+    return cachedStatsConfig;
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      const issues = error.issues.map(
+        (issue) => `  - ${issue.path.join('.')}: ${issue.message}`
+      );
+      throw new Error(`Stats configuration validation failed:\n${issues.join('\n')}`);
     }
     throw error;
   }

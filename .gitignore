@@ -17,6 +17,8 @@ build/
 .env.99
 .env.bak
 .env.local
+.env.fallback
+.env.main
 .env.*.local
 .env.production
 

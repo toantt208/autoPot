@@ -9,15 +9,15 @@
  * Usage: node dist/stats.js <event_type>
  */
 
-import { getConfig } from './config/index.js';
 import { getEventConfig } from './config/events.js';
-import { TradingClient } from './clients/trading-client.js';
 import { MarketClient } from './clients/market-client.js';
-import { fetchPrices } from './services/price-monitor.js';
+import { getRTDSClient, RTDSClient } from './clients/rtds-client.js';
+import {
+  fetchCryptoPrice,
+  calculatePriceChange,
+} from './services/crypto-price-api.js';
 import {
   calculateMarketWindow,
-  isInTradingWindow,
-  getSecondsUntilTradingWindow,
   formatWindowInfo,
 } from './services/market-timing.js';
 import { logger } from './utils/logger.js';
@@ -25,9 +25,40 @@ import { sleep } from './utils/retry.js';
 import * as fs from 'fs';
 import { prisma } from './db/index.js';
 
+const STATS_WINDOW_SECS = 300;    // Collect prices for last 5 minutes
 const FALLBACK_WINDOW_SECS = 10;
 const RETRY_AFTER_CLOSE_SECS = 5;
 const POLL_INTERVAL_MS = 500;
+
+/**
+ * Fetch market prices without requiring full trading credentials
+ * Uses the public CLOB prices endpoint
+ */
+async function fetchMarketPrices(
+  upTokenId: string,
+  downTokenId: string
+): Promise<{ upPrice: number; downPrice: number }> {
+  const response = await fetch('https://clob.polymarket.com/prices', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify([
+      { token_id: upTokenId, side: 'BUY' },
+      { token_id: downTokenId, side: 'BUY' },
+    ]),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const data = await response.json() as Record<string, { BUY?: string; SELL?: string }>;
+
+  // Response format: { "token_id": { "BUY": "0.7", "SELL": "0.8" }, ... }
+  const upPrice = parseFloat(data[upTokenId]?.BUY || '0');
+  const downPrice = parseFloat(data[downTokenId]?.BUY || '0');
+
+  return { upPrice, downPrice };
+}
 
 interface PriceSnapshot {
   timestamp: number;
@@ -36,6 +67,8 @@ interface PriceSnapshot {
   downPrice: number;
   higherSide: 'UP' | 'DOWN';
   phase: 'phase1' | 'phase2' | 'retry';
+  tokenPrice: number | null; // Real-time Chainlink price from RTDS
+  beatPrice: number | null;  // Chainlink openPrice (beat price) for reference
 }
 
 interface FlipEvent {
@@ -75,6 +108,9 @@ interface WindowStats {
   phase2FinalSide: 'UP' | 'DOWN' | null;
   wouldHaveWon: boolean | null;
   simulatedTrade: SimulatedTrade | null;
+  beatPrice: number | null;      // Chainlink openPrice at window start
+  finalPrice: number | null;     // Chainlink closePrice at window end
+  priceChange: number | null;    // % change
 }
 
 interface SessionStats {
@@ -93,6 +129,22 @@ function getPhase(now: number, fallbackStart: number, marketCloseTime: number): 
   if (now < fallbackStart) return 'phase1';
   if (now < marketCloseTime) return 'phase2';
   return 'retry';
+}
+
+/**
+ * Check if we're in the stats collection window (last 5 minutes before close + retry period)
+ */
+function isInStatsWindow(window: MarketWindow, now: number): boolean {
+  const statsWindowStart = window.marketCloseTime - STATS_WINDOW_SECS;
+  return now >= statsWindowStart && now < window.endTime;
+}
+
+interface MarketWindow {
+  slug: string;
+  startTime: number;
+  marketCloseTime: number;
+  endTime: number;
+  tradingWindowStart: number;
 }
 
 /**
@@ -122,6 +174,9 @@ async function saveWindowStatsToDb(
           phase2FinalSide: windowStats.phase2FinalSide,
           finalSide: windowStats.finalSide,
           wouldHaveWon: windowStats.wouldHaveWon,
+          beatPrice: windowStats.beatPrice,
+          finalPrice: windowStats.finalPrice,
+          priceChange: windowStats.priceChange,
         },
       });
 
@@ -136,6 +191,8 @@ async function saveWindowStatsToDb(
             downPrice: s.downPrice,
             higherSide: s.higherSide,
             phase: s.phase,
+            tokenPrice: s.tokenPrice,
+            beatPrice: s.beatPrice,
           })),
         });
       }
@@ -189,15 +246,14 @@ async function saveWindowStatsToDb(
 }
 
 async function collectWindowStats(
-  tradingClient: TradingClient,
   marketClient: MarketClient,
-  eventConfig: any,
-  config: any
+  rtdsClient: RTDSClient,
+  eventConfig: any
 ): Promise<WindowStats | null> {
   const now = Math.floor(Date.now() / 1000);
   const window = calculateMarketWindow(eventConfig, now);
 
-  if (!isInTradingWindow(window, now)) {
+  if (!isInStatsWindow(window, now)) {
     return null;
   }
 
@@ -226,16 +282,40 @@ async function collectWindowStats(
     phase2FinalSide: null,
     wouldHaveWon: null,
     simulatedTrade: null,
+    beatPrice: null,
+    finalPrice: null,
+    priceChange: null,
   };
 
   let lastSide: 'UP' | 'DOWN' | null = null;
   let lastHigherPrice: number = 0;
   let phase1LastSide: 'UP' | 'DOWN' | null = null;
 
+  // Track max price ever seen for each side
+  let maxPriceEver: { UP: number; DOWN: number } = { UP: 0, DOWN: 0 };
+
   // Simulated trade tracking
   let simTradeEntry: { side: 'UP' | 'DOWN'; price: number } | null = null;
 
   logger.info({ slug: window.slug, window: formatWindowInfo(window, now) }, 'Starting price collection');
+
+  // Fetch beatPrice (Chainlink openPrice) at the start of collection
+  // This is the reference price that the market is comparing against
+  const initialPriceData = await fetchCryptoPrice(
+    eventConfig.crypto,
+    new Date(window.startTime * 1000),
+    new Date(window.marketCloseTime * 1000),
+    eventConfig.interval
+  );
+  const beatPrice = initialPriceData?.openPrice ?? null;
+  stats.beatPrice = beatPrice;
+
+  if (beatPrice) {
+    logger.info(
+      { slug: window.slug, crypto: eventConfig.crypto.toUpperCase(), beatPrice: beatPrice.toFixed(2) },
+      'Fetched beat price at collection start'
+    );
+  }
 
   // Collect prices until retry deadline
   while (Math.floor(Date.now() / 1000) < retryDeadline) {
@@ -244,9 +324,13 @@ async function collectWindowStats(
       const timeLeft = window.marketCloseTime - currentTime;
       const phase = getPhase(currentTime, fallbackStart, window.marketCloseTime);
 
-      const snapshot = await fetchPrices(tradingClient, tokenIds);
-      const { upPrice, downPrice } = snapshot;
+      const { upPrice, downPrice } = await fetchMarketPrices(tokenIds.up, tokenIds.down);
       const higherSide: 'UP' | 'DOWN' = upPrice >= downPrice ? 'UP' : 'DOWN';
+
+      // Get real-time token price from RTDS WebSocket
+      const cryptoSymbol = eventConfig.crypto.toUpperCase();
+      const rtdsPrice = rtdsClient.getLatestPrice(cryptoSymbol);
+      const tokenPrice = rtdsPrice?.price ?? null;
 
       const priceSnapshot: PriceSnapshot = {
         timestamp: currentTime,
@@ -255,13 +339,21 @@ async function collectWindowStats(
         downPrice,
         higherSide,
         phase,
+        tokenPrice,
+        beatPrice,
       };
 
       stats.snapshots.push(priceSnapshot);
 
+      // Update max price ever seen for each side
+      if (upPrice > maxPriceEver.UP) maxPriceEver.UP = upPrice;
+      if (downPrice > maxPriceEver.DOWN) maxPriceEver.DOWN = downPrice;
+
       // Track side flips
       if (lastSide !== null && lastSide !== higherSide) {
-        const wasAt98 = lastHigherPrice >= 0.98;
+        // wasAt98 = true if the LOSING side ever reached 98%+ at any point
+        // (the side that was winning but now lost)
+        const wasAt98 = maxPriceEver[lastSide] >= 0.98;
         stats.sideFlips++;
         if (wasAt98) {
           stats.flipsAt98++;
@@ -283,6 +375,7 @@ async function collectWindowStats(
             timeLeft: `${timeLeft}s`,
             up: `${(upPrice * 100).toFixed(2)}%`,
             down: `${(downPrice * 100).toFixed(2)}%`,
+            maxPrice: `${(maxPriceEver[lastSide] * 100).toFixed(2)}%`,
             wasAt98,
           },
           wasAt98 ? 'Side FLIP at 98%+!' : 'Side FLIP detected!'
@@ -319,6 +412,7 @@ async function collectWindowStats(
           up: `${(upPrice * 100).toFixed(2)}%`,
           down: `${(downPrice * 100).toFixed(2)}%`,
           higher: higherSide,
+          tokenPrice: tokenPrice?.toFixed(2) ?? 'N/A',
         },
         'Price snapshot'
       );
@@ -333,6 +427,30 @@ async function collectWindowStats(
   stats.phase1FinalSide = phase1LastSide;
   stats.phase2FinalSide = lastSide;
   stats.finalSide = lastSide;
+
+  // Final check: if any side reached 98%+ but is NOT the final side, ensure it's counted
+  // This handles cases where API errors caused us to miss the actual flip
+  if (stats.finalSide) {
+    const losingSide = stats.finalSide === 'UP' ? 'DOWN' : 'UP';
+    if (maxPriceEver[losingSide] >= 0.98) {
+      // Check if we already counted this flip
+      const alreadyCounted = stats.flipEvents.some(
+        f => f.fromSide === losingSide && f.wasAt98
+      );
+      if (!alreadyCounted) {
+        stats.flipsAt98++;
+        logger.info(
+          {
+            slug: window.slug,
+            losingSide,
+            maxPrice: `${(maxPriceEver[losingSide] * 100).toFixed(2)}%`,
+            finalSide: stats.finalSide,
+          },
+          'Adding missed flip at 98% (API errors may have caused missed detection)'
+        );
+      }
+    }
+  }
 
   // Calculate simulated trade result
   if (simTradeEntry && stats.finalSide) {
@@ -376,6 +494,58 @@ async function collectWindowStats(
       },
       won ? 'Simulated trade WON!' : 'Simulated trade LOST'
     );
+  }
+
+  // Fetch finalPrice (Chainlink closePrice) with retries
+  // beatPrice was already fetched at the start of collection
+  // Retry up to 5 times with 5s delay to wait for closePrice to be available
+  // (Chainlink price finalization can take 10-20 seconds after window close)
+  const MAX_PRICE_RETRIES = 5;
+  const PRICE_RETRY_DELAY_MS = 5000;
+
+  for (let attempt = 1; attempt <= MAX_PRICE_RETRIES; attempt++) {
+    const cryptoPriceData = await fetchCryptoPrice(
+      eventConfig.crypto,
+      new Date(window.startTime * 1000),
+      new Date(window.marketCloseTime * 1000),
+      eventConfig.interval
+    );
+
+    if (cryptoPriceData) {
+      // Update beatPrice if we didn't get it earlier (fallback)
+      if (stats.beatPrice === null) {
+        stats.beatPrice = cryptoPriceData.openPrice;
+      }
+      stats.finalPrice = cryptoPriceData.closePrice;
+
+      if (stats.beatPrice && stats.finalPrice) {
+        stats.priceChange = calculatePriceChange(stats.beatPrice, stats.finalPrice);
+      }
+
+      logger.info(
+        {
+          slug: window.slug,
+          crypto: eventConfig.crypto.toUpperCase(),
+          beatPrice: stats.beatPrice?.toFixed(2),
+          finalPrice: stats.finalPrice?.toFixed(2),
+          priceChange: stats.priceChange !== null ? `${stats.priceChange >= 0 ? '+' : ''}${stats.priceChange.toFixed(4)}%` : 'N/A',
+          finalSide: stats.finalSide,
+          attempt,
+        },
+        'Chainlink price comparison'
+      );
+
+      // If we got the closePrice, stop retrying
+      if (stats.finalPrice !== null) {
+        break;
+      }
+    }
+
+    // If closePrice is null and we have more attempts, wait and retry
+    if (attempt < MAX_PRICE_RETRIES && stats.finalPrice === null) {
+      logger.info({ attempt, maxRetries: MAX_PRICE_RETRIES }, 'closePrice not yet available, retrying...');
+      await sleep(PRICE_RETRY_DELAY_MS);
+    }
   }
 
   logger.info(
@@ -436,14 +606,18 @@ async function main() {
     process.exit(1);
   }
 
-  const config = getConfig();
   const eventConfig = getEventConfig(eventType);
   const cryptoUpper = eventConfig.crypto.toUpperCase();
 
   logger.info({ crypto: cryptoUpper, interval: eventConfig.interval }, 'Starting price stats collector');
 
-  const tradingClient = new TradingClient(config);
   const marketClient = new MarketClient();
+
+  // Initialize RTDS WebSocket client for real-time Chainlink prices
+  const rtdsClient = getRTDSClient();
+  rtdsClient.connect();
+  rtdsClient.subscribeCryptoPrices([cryptoUpper]);
+  logger.info({ crypto: cryptoUpper }, 'Subscribed to RTDS crypto prices');
 
   const sessionStats: SessionStats = {
     crypto: cryptoUpper,
@@ -464,6 +638,9 @@ async function main() {
   const shutdown = () => {
     if (isShuttingDown) return;
     isShuttingDown = true;
+
+    // Disconnect RTDS WebSocket
+    rtdsClient.disconnect();
 
     // Calculate final stats
     sessionStats.totalWindows = sessionStats.windows.length;
@@ -486,15 +663,14 @@ async function main() {
     const now = Math.floor(Date.now() / 1000);
     const window = calculateMarketWindow(eventConfig, now);
 
-    // Check if we should start collecting
-    if (isInTradingWindow(window, now) && !processedWindows.has(window.slug)) {
+    // Check if we should start collecting (last 5 minutes before close)
+    if (isInStatsWindow(window, now) && !processedWindows.has(window.slug)) {
       processedWindows.add(window.slug);
 
       const windowStats = await collectWindowStats(
-        tradingClient,
         marketClient,
-        eventConfig,
-        config
+        rtdsClient,
+        eventConfig
       );
 
       if (windowStats) {
@@ -512,11 +688,12 @@ async function main() {
         );
       }
     } else {
-      const untilTrading = getSecondsUntilTradingWindow(window);
-      if (untilTrading > 0) {
+      const statsWindowStart = window.marketCloseTime - STATS_WINDOW_SECS;
+      const untilStats = Math.max(0, statsWindowStart - now);
+      if (untilStats > 0) {
         logger.info(
-          { crypto: cryptoUpper, window: formatWindowInfo(window), untilTrading },
-          `Waiting for next window in ${untilTrading}s`
+          { crypto: cryptoUpper, window: formatWindowInfo(window), untilStats },
+          `Waiting for stats window in ${untilStats}s (5 min before close)`
         );
       }
     }
@@ -526,6 +703,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  logger.fatal({ error }, 'Fatal error');
+  logger.fatal({ error: error?.message || error, stack: error?.stack }, 'Fatal error');
+  console.error('Full error:', error);
   process.exit(1);
 });

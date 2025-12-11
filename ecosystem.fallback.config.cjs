@@ -7,6 +7,7 @@ module.exports = {
       output: './logs/fb-redeem-out.log',
       error: './logs/fb-redeem-error.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      node_args: '--env-file=.env.fallback',
       time: true,
     },
     // 15-minute markets - fallback strategy
@@ -17,6 +18,7 @@ module.exports = {
       output: './logs/fb-btc-15m-out.log',
       error: './logs/fb-btc-15m-error.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      node_args: '--env-file=.env.fallback',
       time: true,
     },
     {
@@ -26,6 +28,7 @@ module.exports = {
       output: './logs/fb-eth-15m-out.log',
       error: './logs/fb-eth-15m-error.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      node_args: '--env-file=.env.fallback',
       time: true,
     },
     {
@@ -35,6 +38,7 @@ module.exports = {
       output: './logs/fb-sol-15m-out.log',
       error: './logs/fb-sol-15m-error.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      node_args: '--env-file=.env.fallback',
       time: true,
     },
     {
@@ -44,6 +48,7 @@ module.exports = {
       output: './logs/fb-xrp-15m-out.log',
       error: './logs/fb-xrp-15m-error.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      node_args: '--env-file=.env.fallback',
       time: true,
     },
   ],

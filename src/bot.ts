@@ -11,8 +11,15 @@ import { MarketClient } from './clients/market-client.js';
 import { TradeTracker } from './services/trade-executor.js';
 import { processMarketAutoFallback } from './strategies/auto-fallback-strategy.js';
 import { processMarket } from './strategies/ninety-nine-strategy.js';
+import {
+  processMarketMartingale,
+  createMartingaleState,
+  getOrCreateMartingaleState,
+  type MartingaleState,
+} from './strategies/martingale-strategy.js';
+import { processMarketHigherSide } from './strategies/higher-side-strategy.js';
 
-export type StrategyType = 'fallback' | 'ninetynine';
+export type StrategyType = 'fallback' | 'ninetynine' | 'martingale' | 'higherside';
 import {
   calculateMarketWindow,
   getSecondsUntilTradingWindow,
@@ -30,16 +37,27 @@ export interface BotOptions {
   eventConfig: EventConfig;
   /** Strategy to use (default: fallback) */
   strategy?: StrategyType;
+  /** Martingale options */
+  martingale?: {
+    baseBet: number;
+    targetSide: 'UP' | 'DOWN';
+  };
 }
 
 /**
  * Run the trading bot for a single event
  */
 export async function runBot(options: BotOptions): Promise<void> {
-  const { eventConfig, strategy = 'fallback' } = options;
+  const { eventConfig, strategy = 'fallback', martingale } = options;
   const cryptoUpper = eventConfig.crypto.toUpperCase();
 
-  const strategyName = strategy === 'ninetynine' ? '99% Strategy' : 'Auto Fallback';
+  const strategyNames: Record<StrategyType, string> = {
+    fallback: 'Auto Fallback',
+    ninetynine: '99% Strategy',
+    martingale: 'Martingale',
+    higherside: 'Higher Side (60%+)',
+  };
+  const strategyName = strategyNames[strategy];
   logger.info({ crypto: cryptoUpper, interval: eventConfig.interval, strategy: strategyName }, `Starting Polymarket ${cryptoUpper} Trading Bot`);
 
   // Load and validate configuration
@@ -116,20 +134,68 @@ export async function runBot(options: BotOptions): Promise<void> {
     `Next trading opportunity in ${untilTrading}s (${eventConfig.tradingWindowSeconds}s window)`
   );
 
+  // Initialize Martingale state if using martingale strategy
+  let martingaleState: MartingaleState | null = null;
+  if (strategy === 'martingale') {
+    if (!martingale) {
+      logger.fatal('Martingale strategy requires martingale options (baseBet, targetSide)');
+      process.exit(1);
+    }
+    // Load state from database (or create if new)
+    martingaleState = await getOrCreateMartingaleState(
+      eventConfig.crypto,
+      `${eventConfig.interval}m`,
+      martingale.targetSide,
+      martingale.baseBet
+    );
+    logger.info(
+      {
+        baseBet: martingaleState.baseBet,
+        targetSide: martingaleState.targetSide,
+        currentBet: martingaleState.currentBet,
+        totalProfit: martingaleState.totalProfit,
+        wins: martingaleState.wins,
+        losses: martingaleState.losses,
+        currentStreak: martingaleState.currentStreak,
+      },
+      'Martingale state loaded from database'
+    );
+  }
+
   // Main loop
   logger.info('Entering main loop...');
 
   while (!isShuttingDown) {
     try {
-      // Use selected strategy
-      const processStrategy = strategy === 'ninetynine' ? processMarket : processMarketAutoFallback;
-      const result = await processStrategy(
-        eventConfig,
-        tradingClient,
-        marketClient,
-        tradeTracker,
-        config
-      );
+      let result;
+
+      if (strategy === 'martingale' && martingaleState) {
+        result = await processMarketMartingale(
+          eventConfig,
+          tradingClient,
+          marketClient,
+          tradeTracker,
+          config,
+          martingaleState
+        );
+      } else if (strategy === 'higherside') {
+        result = await processMarketHigherSide(
+          eventConfig,
+          tradingClient,
+          marketClient,
+          tradeTracker,
+          config
+        );
+      } else {
+        const processStrategy = strategy === 'ninetynine' ? processMarket : processMarketAutoFallback;
+        result = await processStrategy(
+          eventConfig,
+          tradingClient,
+          marketClient,
+          tradeTracker,
+          config
+        );
+      }
 
       if (result) {
         if (result.traded && result.tradeResult) {
@@ -142,20 +208,24 @@ export async function runBot(options: BotOptions): Promise<void> {
             },
             'Trade completed'
           );
+
+          // For martingale, we need to track results and update state
+          // This would require waiting for market resolution...
+          // For now, log the state
+          if (martingaleState) {
+            logger.info(
+              {
+                currentBet: martingaleState.currentBet,
+                totalProfit: martingaleState.totalProfit,
+                streak: martingaleState.currentStreak,
+              },
+              'Martingale state (bet placed, awaiting resolution)'
+            );
+          }
         } else if (result.skipReason) {
           logger.debug(
             { market: result.marketSlug, reason: result.skipReason },
             'Market skipped'
-          );
-        }
-      } else {
-        // Log next window when nothing to process
-        const nextWindow = calculateMarketWindow(eventConfig);
-        const untilTrading = getSecondsUntilTradingWindow(nextWindow);
-        if (untilTrading > 0) {
-          logger.info(
-            { crypto: cryptoUpper, window: formatWindowInfo(nextWindow), untilTrading },
-            `Waiting for next trading window in ${untilTrading}s`
           );
         }
       }
