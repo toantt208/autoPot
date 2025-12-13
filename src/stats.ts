@@ -332,6 +332,14 @@ async function collectWindowStats(
       const rtdsPrice = rtdsClient.getLatestPrice(cryptoSymbol);
       const tokenPrice = rtdsPrice?.price ?? null;
 
+      // Warn if RTDS price is stale (older than 30 seconds)
+      if (rtdsPrice && (Date.now() - rtdsPrice.timestamp > 30000)) {
+        logger.warn(
+          { symbol: cryptoSymbol, priceAge: `${Math.floor((Date.now() - rtdsPrice.timestamp) / 1000)}s` },
+          'RTDS price is stale - WebSocket may be disconnected'
+        );
+      }
+
       const priceSnapshot: PriceSnapshot = {
         timestamp: currentTime,
         timeLeft,
@@ -340,7 +348,7 @@ async function collectWindowStats(
         higherSide,
         phase,
         tokenPrice,
-        beatPrice,
+        beatPrice: stats.beatPrice, // Use stats.beatPrice to ensure fallback value is used
       };
 
       stats.snapshots.push(priceSnapshot);
@@ -545,6 +553,13 @@ async function collectWindowStats(
     if (attempt < MAX_PRICE_RETRIES && stats.finalPrice === null) {
       logger.info({ attempt, maxRetries: MAX_PRICE_RETRIES }, 'closePrice not yet available, retrying...');
       await sleep(PRICE_RETRY_DELAY_MS);
+    }
+  }
+
+  // Update all snapshots with the final beatPrice (in case it was fetched in fallback retry)
+  if (stats.beatPrice !== null) {
+    for (const snapshot of stats.snapshots) {
+      snapshot.beatPrice = stats.beatPrice;
     }
   }
 

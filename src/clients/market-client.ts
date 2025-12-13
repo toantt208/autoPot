@@ -17,6 +17,7 @@ export class MarketClient {
     try {
       const url = `${GAMMA_API_URL}/events?slug=${encodeURIComponent(slug)}`;
 
+      logger.info({ url, slug }, 'Requesting event from Gamma API');
       logger.debug({ url, slug }, 'Fetching event from Gamma API');
 
       const response = await fetch(url, {

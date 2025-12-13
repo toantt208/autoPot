@@ -1,0 +1,47 @@
+module.exports = {
+  apps: [
+    {
+      name: 'pm-higherside-xrp-15m',
+      script: 'dist/index.js',
+      args: 'xrp_15m higherside',
+      cwd: '/Users/toantt/www/toantt/polymarket-autotrade',
+      env: {
+        DOTENV_CONFIG_PATH: '.env.xrp_higher',
+      },
+      output: './logs/xrp-15m-higherside-out.log',
+      error: './logs/xrp-15m-higherside-error.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      time: true,
+    },
+    // {
+    //   name: 'polymarket-btc-15m-higherside',
+    //   script: 'dist/index.js',
+    //   args: 'btc_15m higherside',
+    //   env_file: '.env.higherxrp',
+    //   output: './logs/btc-15m-higherside-out.log',
+    //   error: './logs/btc-15m-higherside-error.log',
+    //   log_date_format: 'YYYY-MM-DD HH:mm:ss',
+    //   time: true,
+    // },
+    // {
+    //   name: 'polymarket-eth-15m-higherside',
+    //   script: 'dist/index.js',
+    //   args: 'eth_15m higherside',
+    //   env_file: '.env.higherxrp',
+    //   output: './logs/eth-15m-higherside-out.log',
+    //   error: './logs/eth-15m-higherside-error.log',
+    //   log_date_format: 'YYYY-MM-DD HH:mm:ss',
+    //   time: true,
+    // },
+    // {
+    //   name: 'polymarket-sol-15m-higherside',
+    //   script: 'dist/index.js',
+    //   args: 'sol_15m higherside',
+    //   env_file: '.env.higherxrp',
+    //   output: './logs/sol-15m-higherside-out.log',
+    //   error: './logs/sol-15m-higherside-error.log',
+    //   log_date_format: 'YYYY-MM-DD HH:mm:ss',
+    //   time: true,
+    // },
+  ],
+};

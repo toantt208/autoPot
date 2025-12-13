@@ -82,6 +82,17 @@ export interface MarketBuyParams {
   tickSize: string;
 }
 
+export interface MarketSellParams {
+  /** Token ID of the outcome to sell */
+  tokenId: string;
+  /** Amount of tokens to sell (in token units, not USDC) */
+  amount: number;
+  /** Whether this is a neg risk market */
+  negRisk: boolean;
+  /** Minimum tick size for order prices */
+  tickSize: string;
+}
+
 export interface AllowanceStatus {
   usdcToNegRiskExchange: BigNumber;
   usdcToNegRiskAdapter: BigNumber;
@@ -200,6 +211,38 @@ export class TradingClient {
   }
 
   /**
+   * Get batch SELL prices for multiple tokens in one API call
+   * Used by stop-loss to check exit conditions
+   */
+  async getBatchSellPrices(upTokenId: string, downTokenId: string): Promise<{ upSellPrice: number; downSellPrice: number }> {
+    try {
+      const response = await fetch('https://clob.polymarket.com/prices', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([
+          { token_id: upTokenId, side: 'SELL' },
+          { token_id: downTokenId, side: 'SELL' },
+        ]),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      // Response format: { "token_id": { "BUY": "0.7", "SELL": "0.65" }, ... }
+      const upSellPrice = parseFloat(data[upTokenId]?.SELL || '0');
+      const downSellPrice = parseFloat(data[downTokenId]?.SELL || '0');
+
+      logger.debug({ upSellPrice, downSellPrice }, 'Batch sell prices fetched');
+      return { upSellPrice, downSellPrice };
+    } catch (error: any) {
+      logger.warn({ error: error?.message }, 'Error fetching batch sell prices');
+      return { upSellPrice: 0, downSellPrice: 0 };
+    }
+  }
+
+  /**
    * Get current sell price for a token
    */
   async getSellPrice(tokenId: string): Promise<number> {
@@ -292,6 +335,55 @@ export class TradingClient {
       'Market buy order placed'
     );
     console.log(result)
+
+    return result;
+  }
+
+  /**
+   * Place a market sell order (FAK - Fill And Kill)
+   * Sells outcome tokens back to the market
+   */
+  async marketSell(params: MarketSellParams) {
+    const { tokenId, amount, negRisk, tickSize } = params;
+
+    logger.info(
+      {
+        tokenId: tokenId.slice(0, 20) + '...',
+        amount,
+        negRisk,
+        tickSize,
+        dryRun: this.dryRun,
+      },
+      'Placing market sell order'
+    );
+
+    if (this.dryRun) {
+      logger.info({ tokenId: tokenId.slice(0, 20) + '...', amount }, 'DRY RUN: Would place market sell order');
+      return {
+        orderID: 'dry-run-sell-order-id',
+        status: 'DRY_RUN',
+      };
+    }
+
+    // Create and post market sell order
+    const result = await this.client.createAndPostMarketOrder(
+      {
+        tokenID: tokenId,
+        amount,
+        side: Side.SELL,
+      },
+      {
+        negRisk,
+        tickSize: tickSize as TickSize,
+      },
+      OrderType.FAK
+    );
+
+    logger.info(
+      { orderId: result.orderID, status: result.status },
+      'Market sell order placed'
+    );
+    console.log(result);
 
     return result;
   }

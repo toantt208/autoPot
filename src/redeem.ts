@@ -11,6 +11,7 @@ import { RedeemService } from './services/redeem-service.js';
 import { logger } from './utils/logger.js';
 
 const REDEEM_INTERVAL_MS = 60 * 1000; // Run every 1 minute
+const RUN_ONCE = process.env.RUN_ONCE === 'true'; // Run once and exit (for cron)
 
 async function runRedeemCycle(redeemService: RedeemService, safeAddress: string, dryRun: boolean) {
   try {
@@ -125,6 +126,12 @@ async function main() {
 
   // Run first cycle immediately
   await runRedeemCycle(redeemService, config.GNOSIS_SAFE_ADDRESS, config.DRY_RUN);
+
+  // If RUN_ONCE mode, exit after first cycle
+  if (RUN_ONCE) {
+    logger.info('RUN_ONCE mode - exiting after first cycle');
+    process.exit(0);
+  }
 
   // Main loop - run every minute
   logger.info('Entering main loop (checking every 60s)...');

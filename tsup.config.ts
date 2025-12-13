@@ -9,6 +9,7 @@ export default defineConfig({
     'src/approve-all.ts',
     'src/stats.ts',
     'src/stats-view.ts',
+    'src/stoploss.ts',
   ],
   format: ['esm'],
   dts: true,

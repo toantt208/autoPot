@@ -5,8 +5,9 @@
 import { z } from 'zod';
 import dotenv from 'dotenv';
 
-// Load .env file (don't override existing env vars)
-dotenv.config({ override: false });
+// Load .env file (or custom path from DOTENV_CONFIG_PATH)
+const envPath = process.env.DOTENV_CONFIG_PATH;
+dotenv.config({ path: envPath, override: false });
 
 const configSchema = z.object({
   // Wallet & Auth
@@ -46,6 +47,10 @@ const configSchema = z.object({
     .default('false')
     .transform((val) => val.toLowerCase() === 'true'),
   IS_SERVER: z
+    .string()
+    .default('false')
+    .transform((val) => val.toLowerCase() === 'true'),
+  SKIP_TX_CONFIRMATION: z
     .string()
     .default('false')
     .transform((val) => val.toLowerCase() === 'true'),
