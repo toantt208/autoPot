@@ -4,7 +4,6 @@ module.exports = {
       name: 'pm-higherside-xrp-15m',
       script: 'dist/index.js',
       args: 'xrp_15m higherside',
-      cwd: '/Users/toantt/www/toantt/polymarket-autotrade',
       env: {
         DOTENV_CONFIG_PATH: '.env.xrp_higher',
       },
@@ -16,7 +15,6 @@ module.exports = {
     {
       name: 'pm-higherside-redeem',
       script: 'dist/redeem.js',
-      cwd: '/Users/toantt/www/toantt/polymarket-autotrade',
       env: {
         DOTENV_CONFIG_PATH: '.env.xrp_higher',
         RUN_ONCE: 'true',
