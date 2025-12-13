@@ -36,7 +36,7 @@ const TX_POLL_INTERVAL_MS = 2000; // Poll every 2 seconds
 
 // Strategy parameters
 const STATS_WINDOW_SECS = 300; // 5 minutes before close (same as stats collector)
-const MIN_HIGHER_SIDE_PRICE = 0.60; // Minimum 60% to enter
+const MIN_HIGHER_SIDE_PRICE = 0.58; // Minimum 60% to enter
 const RETRY_AFTER_CLOSE_SECS = 5; // Retry period after close if no match
 
 export interface StrategyResult {
