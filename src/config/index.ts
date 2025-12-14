@@ -27,6 +27,7 @@ const configSchema = z.object({
   // Trading Parameters
   BET_AMOUNT_USDC: z.coerce.number().positive().default(10),
   MIN_PRICE_THRESHOLD: z.coerce.number().min(0.90).max(1).default(0.99),
+  MIN_HIGHER_SIDE_PRICE: z.coerce.number().min(0.50).max(0.99).default(0.60),
 
   // Target Markets
   TARGET_CRYPTOS: z.string().default('btc,eth,sol'),

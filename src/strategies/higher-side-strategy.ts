@@ -35,8 +35,7 @@ const TX_CONFIRM_TIMEOUT_MS = 10000; // 10 seconds
 const TX_POLL_INTERVAL_MS = 2000; // Poll every 2 seconds
 
 // Strategy parameters
-const STATS_WINDOW_SECS = 300; // 5 minutes before close (same as stats collector)
-const MIN_HIGHER_SIDE_PRICE = 0.58; // Minimum 60% to enter
+const STATS_WINDOW_SECS = 120; // 5 minutes before close (same as stats collector)
 const RETRY_AFTER_CLOSE_SECS = 5; // Retry period after close if no match
 
 export interface StrategyResult {
@@ -207,17 +206,17 @@ export async function executeHigherSideStrategy(
         down: `${(downPrice * 100).toFixed(2)}%`,
         higherSide,
         higherPrice: `${(higherPrice * 100).toFixed(2)}%`,
-        minRequired: `${(MIN_HIGHER_SIDE_PRICE * 100).toFixed(0)}%`,
+        minRequired: `${(config.MIN_HIGHER_SIDE_PRICE * 100).toFixed(0)}%`,
         time: timeInfo,
       },
       'Checking entry conditions'
     );
 
     // Check if higher side meets threshold
-    if (higherPrice < MIN_HIGHER_SIDE_PRICE) {
+    if (higherPrice < config.MIN_HIGHER_SIDE_PRICE) {
       logger.info(
-        { slug: window.slug, higherPrice: `${(higherPrice * 100).toFixed(2)}%`, time: timeInfo },
-        'Higher side below 60% threshold, waiting...'
+        { slug: window.slug, higherPrice: `${(higherPrice * 100).toFixed(2)}%`, minRequired: `${(config.MIN_HIGHER_SIDE_PRICE * 100).toFixed(0)}%`, time: timeInfo },
+        'Higher side below threshold, waiting...'
       );
       if (config.IS_SERVER) {
         await sleep(SERVER_RETRY_DELAY_MS);
