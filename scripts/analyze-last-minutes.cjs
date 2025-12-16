@@ -68,8 +68,7 @@ async function main() {
     const hp = trade.higher_price;
     const entryPrice = typeof hp === 'object' && hp !== null ? parseFloat(hp.toString()) : parseFloat(hp);
     if (isNaN(entryPrice) || entryPrice <= 0 || entryPrice > 1) {
-      console.log('Invalid entry price:', entryPrice, trade);
-      continue;
+      continue; // Skip invalid entries
     }
     const shares = BET_AMOUNT / entryPrice;
 

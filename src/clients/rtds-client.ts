@@ -10,8 +10,10 @@ import { EventEmitter } from 'events';
 import { logger } from '../utils/logger.js';
 
 const RTDS_URL = 'wss://ws-live-data.polymarket.com';
-const PING_INTERVAL_MS = 5000;
+const PING_INTERVAL_MS = 10000;
+const PONG_TIMEOUT_MS = 30000; // If no pong in 30s, reconnect
 const RECONNECT_DELAY_MS = 3000;
+const DATA_TIMEOUT_MS = 30000; // If no data in 30s, reconnect
 
 export interface CryptoPriceUpdate {
   symbol: string;
@@ -35,11 +37,14 @@ interface Subscription {
 export class RTDSClient extends EventEmitter {
   private ws: WebSocket | null = null;
   private pingInterval: NodeJS.Timeout | null = null;
+  private pongTimeout: NodeJS.Timeout | null = null;
+  private dataCheckInterval: NodeJS.Timeout | null = null;
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private isConnected = false;
   private autoReconnect = true;
   private subscriptions: Subscription[] = [];
   private latestPrices: Map<string, CryptoPriceUpdate> = new Map();
+  private lastDataTime: number = 0;
 
   constructor() {
     super();
@@ -59,10 +64,12 @@ export class RTDSClient extends EventEmitter {
 
     this.ws.on('open', () => {
       this.isConnected = true;
+      this.lastDataTime = Date.now();
       logger.info('RTDS WebSocket connected');
 
-      // Start ping interval
+      // Start ping interval and data check
       this.startPing();
+      this.startDataCheck();
 
       // Re-subscribe if reconnecting
       if (this.subscriptions.length > 0) {
@@ -72,17 +79,22 @@ export class RTDSClient extends EventEmitter {
       this.emit('connected');
     });
 
+    this.ws.on('pong', () => {
+      // Clear pong timeout on pong received
+      if (this.pongTimeout) {
+        clearTimeout(this.pongTimeout);
+        this.pongTimeout = null;
+      }
+      logger.debug('RTDS pong received');
+    });
+
     this.ws.on('message', (data: WebSocket.Data) => {
       try {
         const raw = data.toString();
-        // Log all messages for debugging
-        if (raw.includes('payload')) {
-          logger.debug({ raw: raw.substring(0, 500) }, 'RTDS raw message');
-        }
-
         const message = JSON.parse(raw) as RTDSMessage;
 
         if (message.topic === 'crypto_prices' || message.topic === 'crypto_prices_chainlink') {
+          this.lastDataTime = Date.now();
           this.handleCryptoPriceUpdate(message);
         }
 
@@ -100,6 +112,7 @@ export class RTDSClient extends EventEmitter {
     this.ws.on('close', () => {
       this.isConnected = false;
       this.stopPing();
+      this.stopDataCheck();
       logger.warn('RTDS WebSocket disconnected');
 
       this.emit('disconnected');
@@ -122,7 +135,13 @@ export class RTDSClient extends EventEmitter {
       this.reconnectTimeout = null;
     }
 
+    if (this.pongTimeout) {
+      clearTimeout(this.pongTimeout);
+      this.pongTimeout = null;
+    }
+
     this.stopPing();
+    this.stopDataCheck();
 
     if (this.ws) {
       this.ws.close();
@@ -181,7 +200,7 @@ export class RTDSClient extends EventEmitter {
     };
 
     this.ws.send(JSON.stringify(message));
-    logger.info({ subscriptions: subscriptions.map((s) => s.filters) }, 'Subscribed to RTDS topics');
+    logger.info({ topics: subscriptions.map((s) => s.topic) }, 'Subscribed to RTDS topics');
   }
 
   private handleCryptoPriceUpdate(message: RTDSMessage): void {
@@ -230,6 +249,15 @@ export class RTDSClient extends EventEmitter {
     this.pingInterval = setInterval(() => {
       if (this.ws && this.isConnected) {
         this.ws.ping();
+
+        // Set pong timeout - if no pong received, reconnect
+        if (this.pongTimeout) {
+          clearTimeout(this.pongTimeout);
+        }
+        this.pongTimeout = setTimeout(() => {
+          logger.warn('RTDS pong timeout - reconnecting...');
+          this.forceReconnect();
+        }, PONG_TIMEOUT_MS);
       }
     }, PING_INTERVAL_MS);
   }
@@ -238,6 +266,41 @@ export class RTDSClient extends EventEmitter {
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
+    }
+    if (this.pongTimeout) {
+      clearTimeout(this.pongTimeout);
+      this.pongTimeout = null;
+    }
+  }
+
+  private startDataCheck(): void {
+    this.dataCheckInterval = setInterval(() => {
+      const timeSinceData = Date.now() - this.lastDataTime;
+      if (timeSinceData > DATA_TIMEOUT_MS) {
+        logger.warn({ timeSinceData: `${Math.floor(timeSinceData / 1000)}s` }, 'RTDS no data timeout - reconnecting...');
+        this.forceReconnect();
+      }
+    }, 10000); // Check every 10s
+  }
+
+  private stopDataCheck(): void {
+    if (this.dataCheckInterval) {
+      clearInterval(this.dataCheckInterval);
+      this.dataCheckInterval = null;
+    }
+  }
+
+  private forceReconnect(): void {
+    if (this.ws) {
+      this.ws.terminate(); // Force close
+      this.ws = null;
+    }
+    this.isConnected = false;
+    this.stopPing();
+    this.stopDataCheck();
+
+    if (this.autoReconnect) {
+      this.scheduleReconnect();
     }
   }
 

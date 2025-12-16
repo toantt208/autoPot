@@ -11,7 +11,6 @@
 
 import { getEventConfig } from './config/events.js';
 import { MarketClient } from './clients/market-client.js';
-import { getRTDSClient, RTDSClient } from './clients/rtds-client.js';
 import {
   fetchCryptoPrice,
   calculatePriceChange,
@@ -58,6 +57,23 @@ async function fetchMarketPrices(
   const downPrice = parseFloat(data[downTokenId]?.BUY || '0');
 
   return { upPrice, downPrice };
+}
+
+/**
+ * Get latest token price from database (populated by price-tracker process)
+ */
+async function getLatestTokenPrice(symbol: string): Promise<{ price: number; timestamp: number } | null> {
+  const result = await prisma.tokenPrice.findFirst({
+    where: { symbol: symbol.toUpperCase() },
+    orderBy: { timestamp: 'desc' },
+  });
+
+  if (!result) return null;
+
+  return {
+    price: Number(result.price),
+    timestamp: result.timestamp.getTime(),
+  };
 }
 
 interface PriceSnapshot {
@@ -247,7 +263,6 @@ async function saveWindowStatsToDb(
 
 async function collectWindowStats(
   marketClient: MarketClient,
-  rtdsClient: RTDSClient,
   eventConfig: any
 ): Promise<WindowStats | null> {
   const now = Math.floor(Date.now() / 1000);
@@ -327,16 +342,16 @@ async function collectWindowStats(
       const { upPrice, downPrice } = await fetchMarketPrices(tokenIds.up, tokenIds.down);
       const higherSide: 'UP' | 'DOWN' = upPrice >= downPrice ? 'UP' : 'DOWN';
 
-      // Get real-time token price from RTDS WebSocket
+      // Get real-time token price from database (populated by price-tracker)
       const cryptoSymbol = eventConfig.crypto.toUpperCase();
-      const rtdsPrice = rtdsClient.getLatestPrice(cryptoSymbol);
-      const tokenPrice = rtdsPrice?.price ?? null;
+      const dbPrice = await getLatestTokenPrice(cryptoSymbol);
+      const tokenPrice = dbPrice?.price ?? null;
 
-      // Warn if RTDS price is stale (older than 30 seconds)
-      if (rtdsPrice && (Date.now() - rtdsPrice.timestamp > 30000)) {
+      // Warn if DB price is stale (older than 30 seconds)
+      if (dbPrice && (Date.now() - dbPrice.timestamp > 30000)) {
         logger.warn(
-          { symbol: cryptoSymbol, priceAge: `${Math.floor((Date.now() - rtdsPrice.timestamp) / 1000)}s` },
-          'RTDS price is stale - WebSocket may be disconnected'
+          { symbol: cryptoSymbol, priceAge: `${Math.floor((Date.now() - dbPrice.timestamp) / 1000)}s` },
+          'Token price is stale - price-tracker may not be running'
         );
       }
 
@@ -628,12 +643,6 @@ async function main() {
 
   const marketClient = new MarketClient();
 
-  // Initialize RTDS WebSocket client for real-time Chainlink prices
-  const rtdsClient = getRTDSClient();
-  rtdsClient.connect();
-  rtdsClient.subscribeCryptoPrices([cryptoUpper]);
-  logger.info({ crypto: cryptoUpper }, 'Subscribed to RTDS crypto prices');
-
   const sessionStats: SessionStats = {
     crypto: cryptoUpper,
     interval: `${eventConfig.interval}m`,
@@ -653,9 +662,6 @@ async function main() {
   const shutdown = () => {
     if (isShuttingDown) return;
     isShuttingDown = true;
-
-    // Disconnect RTDS WebSocket
-    rtdsClient.disconnect();
 
     // Calculate final stats
     sessionStats.totalWindows = sessionStats.windows.length;
@@ -684,7 +690,6 @@ async function main() {
 
       const windowStats = await collectWindowStats(
         marketClient,
-        rtdsClient,
         eventConfig
       );
 

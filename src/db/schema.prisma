@@ -124,6 +124,48 @@ model StatsSimulatedTrade {
 }
 
 // ===========================================
+// XRP PRICE LOGGER (for analysis)
+// ===========================================
+
+model XrpPriceLog {
+  id              BigInt   @id @default(autoincrement())
+  windowSlug      String   @map("window_slug") @db.VarChar(100)
+  timestamp       DateTime @db.Timestamptz
+  timeLeft        Int      @map("time_left")              // Seconds until market close
+  beatPrice       Decimal  @map("beat_price") @db.Decimal(20, 8)    // Opening price at window start
+  tokenPrice      Decimal  @map("token_price") @db.Decimal(20, 8)   // Current XRP price
+  priceDiff       Decimal  @map("price_diff") @db.Decimal(20, 8)    // tokenPrice - beatPrice
+  priceDiffPct    Decimal  @map("price_diff_pct") @db.Decimal(10, 6) // % change from beat price
+  upPrice         Decimal  @map("up_price") @db.Decimal(5, 4)       // Market UP price
+  downPrice       Decimal  @map("down_price") @db.Decimal(5, 4)     // Market DOWN price
+  higherSide      String   @map("higher_side") @db.VarChar(4)       // UP or DOWN
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([windowSlug])
+  @@index([timestamp(sort: Desc)])
+  @@index([windowSlug, timestamp(sort: Desc)])
+  @@map("xrp_price_logs")
+}
+
+// ===========================================
+// TOKEN PRICES (Real-time from RTDS socket)
+// ===========================================
+
+model TokenPrice {
+  id        BigInt   @id @default(autoincrement())
+  symbol    String   @db.VarChar(10)              // BTC, ETH, SOL, XRP
+  price     Decimal  @db.Decimal(20, 8)           // Price in USD
+  source    String   @db.VarChar(20)              // chainlink, binance
+  timestamp DateTime @db.Timestamptz              // Price timestamp from source
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([symbol])
+  @@index([timestamp(sort: Desc)])
+  @@index([symbol, timestamp(sort: Desc)])
+  @@map("token_prices")
+}
+
+// ===========================================
 // MARTINGALE STATE
 // ===========================================
 
