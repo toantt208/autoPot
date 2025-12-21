@@ -21,6 +21,7 @@ build/
 .env.main
 .env.*.local
 .env.production
+.env.scale
 
 # Logs
 logs/

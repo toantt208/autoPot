@@ -28,10 +28,19 @@ const TIERED_THRESHOLDS = [
   { maxTimeLeft: 10, threshold: 0.0005 },  // Last 150s: 0.002
   { maxTimeLeft: 50, threshold: 0.001 },  // Last 150s: 0.002
   { maxTimeLeft: 100, threshold: 0.0015 },  // Last 150s: 0.002
-  { maxTimeLeft: 150, threshold: 0.002 },  // Last 150s: 0.002
-  { maxTimeLeft: 300, threshold: 0.004 },  // Last 5min: 0.004
-  { maxTimeLeft: 600, threshold: 0.006 },  // Last 10min: 0.006
+    { maxTimeLeft: 150, threshold: 0.002 },  // Last 150s: 0.002
+    { maxTimeLeft: 300, threshold: 0.004 },  // Last 5min: 0.004
+    { maxTimeLeft: 600, threshold: 0.01},  // Last 10min: 0.006
 ];
+
+
+// this config run in day
+// { maxTimeLeft: 100, threshold: 0.0015 },  // Last 150s: 0.002
+//   // { maxTimeLeft: 150, threshold: 0.002 },  // Last 150s: 0.002
+//   // { maxTimeLeft: 300, threshold: 0.004 },  // Last 5min: 0.004
+//   // { maxTimeLeft: 600, threshold: 0.01},  // Last 10min: 0.006
+
+// 50 run at night.
 
 // Only analyze windows after this slug (data before this had issues)
 const MIN_WINDOW_SLUG = 'xrp-updown-15m-1765755000';
@@ -199,8 +208,14 @@ async function analyzeXrpEntry() {
     const status = isWin ? '✅ WIN' : '❌ LOSS';
     const diffStr = parseFloat(entryLog.priceDiff.toString());
     const profitStr = profit >= 0 ? `+$${profit.toFixed(2)}` : `-$${Math.abs(profit).toFixed(2)}`;
+
+    // Extract timestamp from window_slug and format as HH:MM
+    const windowTimestamp = parseInt(window_slug.split('-').pop()) * 1000;
+    const windowTime = new Date(windowTimestamp);
+    const timeStr = windowTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+
     console.log(
-      `[${window_slug}] ${status} ${profitStr} | ${entrySide} @ ${(entryPrice * 100).toFixed(1)}% | ` +
+      `[${window_slug}] ${timeStr} ${status} ${profitStr} | ${entrySide} @ ${(entryPrice * 100).toFixed(1)}% | ` +
       `T-${entryLog.timeLeft}s (th:${entryThreshold}) | ${diffStr >= 0 ? '+' : ''}${diffStr.toFixed(4)} → ${finalPriceDiff >= 0 ? '+' : ''}${finalPriceDiff.toFixed(4)}`
     );
   }
@@ -216,12 +231,37 @@ async function analyzeXrpEntry() {
   const avgEntryPrice = results.reduce((sum, r) => sum + r.entryPrice, 0) / results.length;
   const avgTimeLeft = results.reduce((sum, r) => sum + r.entryTimeLeft, 0) / results.length;
 
+  // Filter out 99% entries for realized profit (with 2% slippage)
+  const SLIPPAGE = 0.02; // 2% slippage
+  const realizedTrades = results.filter(r => r.entryPrice < 0.99);
+  const realizedWins = realizedTrades.filter(r => r.isWin);
+  const realizedLosses = realizedTrades.filter(r => !r.isWin);
+  // Recalculate profit with slippage
+  const realizedProfit = realizedTrades.reduce((sum, r) => {
+    const adjustedPrice = Math.min(r.entryPrice + SLIPPAGE, 1.0); // Cap at 100%
+    const adjustedPayout = r.isWin ? TRADE_AMOUNT / adjustedPrice : 0;
+    const adjustedProfit = adjustedPayout - TRADE_AMOUNT;
+    return sum + adjustedProfit;
+  }, 0);
+  const realizedAvgPrice = realizedTrades.length > 0
+    ? realizedTrades.reduce((sum, r) => sum + r.entryPrice, 0) / realizedTrades.length
+    : 0;
+
   console.log(`Total trades: ${results.length}`);
   console.log(`Wins: ${wins.length} | Losses: ${losses.length}`);
   console.log(`Win rate: ${((wins.length / results.length) * 100).toFixed(2)}%`);
   console.log(`Total profit: $${totalProfit.toFixed(2)}`);
   console.log(`Avg entry price: ${(avgEntryPrice * 100).toFixed(1)}%`);
   console.log(`Avg time left at entry: ${avgTimeLeft.toFixed(0)}s`);
+
+  console.log('\n--- Realized Profit (excluding 99% entries) ---');
+  console.log(`Trades: ${realizedTrades.length} (excluded ${results.length - realizedTrades.length} @ 99%)`);
+  console.log(`Wins: ${realizedWins.length} | Losses: ${realizedLosses.length}`);
+  if (realizedTrades.length > 0) {
+    console.log(`Win rate: ${((realizedWins.length / realizedTrades.length) * 100).toFixed(2)}%`);
+    console.log(`Realized profit: $${realizedProfit.toFixed(2)}`);
+    console.log(`Avg entry price: ${(realizedAvgPrice * 100).toFixed(1)}%`);
+  }
 
   // Breakdown by side
   console.log('\n--- By Entry Side ---');
@@ -244,8 +284,13 @@ async function analyzeXrpEntry() {
   if (losses.length > 0) {
     console.log('\n--- Loss Analysis ---');
     for (const loss of losses) {
+      // Extract timestamp from window and format as HH:MM
+      const lossTimestamp = parseInt(loss.window.split('-').pop()) * 1000;
+      const lossTime = new Date(lossTimestamp);
+      const lossTimeStr = lossTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+
       console.log(
-        `${loss.window}: Entered ${loss.entrySide} @ ${(loss.entryPrice * 100).toFixed(1)}% | ` +
+        `${loss.window} ${lossTimeStr}: Entered ${loss.entrySide} @ ${(loss.entryPrice * 100).toFixed(1)}% | ` +
         `Diff: ${loss.entryPriceDiff >= 0 ? '+' : ''}${loss.entryPriceDiff.toFixed(4)} → ${loss.finalPriceDiff >= 0 ? '+' : ''}${loss.finalPriceDiff.toFixed(4)}`
       );
     }

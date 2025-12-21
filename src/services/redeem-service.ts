@@ -8,7 +8,7 @@
 import { RelayClient } from '@polymarket/builder-relayer-client';
 import type { SafeTransaction, RelayerTransactionState } from '@polymarket/builder-relayer-client';
 import { BuilderConfig } from '@polymarket/builder-signing-sdk';
-import { Wallet } from 'ethers';
+import { Wallet, Contract } from 'ethers';
 import { encodeFunctionData } from 'viem';
 import { JsonRpcProvider } from '@ethersproject/providers';
 import type { TransactionReceipt } from '@ethersproject/providers';
@@ -55,6 +55,20 @@ const CONDITIONAL_TOKENS_ABI = [
     name: 'redeemPositions',
     outputs: [],
     stateMutability: 'nonpayable',
+    type: 'function',
+  },
+] as const;
+
+// ERC1155 ABI for balance check
+const ERC1155_ABI = [
+  {
+    inputs: [
+      { name: 'account', type: 'address' },
+      { name: 'id', type: 'uint256' },
+    ],
+    name: 'balanceOf',
+    outputs: [{ name: '', type: 'uint256' }],
+    stateMutability: 'view',
     type: 'function',
   },
 ] as const;
@@ -268,14 +282,52 @@ export class RedeemService {
   }
 
   /**
+   * Check onchain ERC1155 balance for a token
+   */
+  async getOnchainBalance(tokenId: string): Promise<bigint> {
+    try {
+      const contract = new Contract(
+        CONTRACTS.CONDITIONAL_TOKENS,
+        ERC1155_ABI,
+        this.provider
+      );
+      const balance = await contract.balanceOf(this.safeAddress, tokenId);
+      return BigInt(balance.toString());
+    } catch (error: any) {
+      logger.error({ tokenId, error: error.message }, 'Error checking onchain balance');
+      return BigInt(0);
+    }
+  }
+
+  /**
    * Redeem a single position using the relay client
    */
   async redeemPosition(position: Position): Promise<RedeemResult> {
+    // Check onchain balance first
+    const onchainBalance = await this.getOnchainBalance(position.asset);
+
+    if (onchainBalance === BigInt(0)) {
+      logger.info(
+        {
+          conditionId: position.conditionId.slice(0, 20) + '...',
+          asset: position.asset.slice(0, 20) + '...',
+          title: position.title,
+        },
+        'Skipping - zero onchain balance'
+      );
+      return {
+        success: true, // Not an error, just nothing to redeem
+        conditionId: position.conditionId,
+        error: 'Zero onchain balance',
+      };
+    }
+
     logger.info(
       {
         conditionId: position.conditionId.slice(0, 20) + '...',
         outcome: position.outcome,
         size: position.size,
+        onchainBalance: onchainBalance.toString(),
         value: position.currentValue,
         negRisk: position.negativeRisk,
         title: position.title,

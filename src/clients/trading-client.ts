@@ -80,6 +80,8 @@ export interface MarketBuyParams {
   negRisk: boolean;
   /** Minimum tick size for order prices (from Gamma API) */
   tickSize: string;
+  /** Order type: FOK (Fill Or Kill) or FAK (Fill And Kill). Default: FOK */
+  orderType?: 'FOK' | 'FAK';
 }
 
 export interface MarketSellParams {
@@ -122,17 +124,6 @@ export class TradingClient {
       passphrase: config.CLOB_PASSPHRASE,
     };
 
-    // Initialize CLOB client with Safe wallet signing
-    this.client = new ClobClient(
-      CLOB_HOST,
-      POLYGON_CHAIN_ID,
-      this.wallet,
-      creds,
-      SignatureType.POLY_GNOSIS_SAFE,
-      config.GNOSIS_SAFE_ADDRESS
-    );
-
-    // Initialize Builder Relayer client for gasless transactions
     const builderConfig = new BuilderConfig({
       localBuilderCreds: {
         key: config.BUILDER_API_KEY,
@@ -141,10 +132,25 @@ export class TradingClient {
       },
     });
 
+    // Initialize CLOB client with Safe wallet signing
+    this.client = new ClobClient(
+      CLOB_HOST,
+      POLYGON_CHAIN_ID,
+      this.wallet,
+      creds,
+      SignatureType.POLY_GNOSIS_SAFE,
+      config.GNOSIS_SAFE_ADDRESS,
+      undefined, // signaturetype2 (not used)
+      false, // useLegacySigning
+      // @ts-ignore
+      builderConfig,
+    );
+
     this.relayClient = new RelayClient(
       RELAYER_URL,
       POLYGON_CHAIN_ID,
       this.wallet,
+      // @ts-ignore
       builderConfig
     );
 
@@ -291,11 +297,12 @@ export class TradingClient {
   }
 
   /**
-   * Place a market buy order (FOK - Fill or Kill)
+   * Place a market buy order
    * negRisk and tickSize come from Gamma API market data
+   * @param orderType - FOK (Fill Or Kill) or FAK (Fill And Kill). Default: FOK
    */
   async marketBuy(params: MarketBuyParams) {
-    const { tokenId, amount, negRisk, tickSize } = params;
+    const { tokenId, amount, negRisk, tickSize, orderType = 'FOK' } = params;
 
     logger.info(
       {
@@ -303,6 +310,7 @@ export class TradingClient {
         amount,
         negRisk,
         tickSize,
+        orderType,
         dryRun: this.dryRun,
       },
       'Placing market buy order'
@@ -327,7 +335,7 @@ export class TradingClient {
         negRisk,
         tickSize: tickSize as TickSize,
       },
-      OrderType.FAK
+      orderType === 'FAK' ? OrderType.FAK : OrderType.FOK
     );
 
     logger.info(

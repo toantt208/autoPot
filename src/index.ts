@@ -15,7 +15,7 @@ import { getEventConfig, listEvents } from './config/events.js';
 import { runBot, type StrategyType } from './bot.js';
 import { logger } from './utils/logger.js';
 
-const VALID_STRATEGIES: StrategyType[] = ['fallback', 'ninetynine', 'martingale', 'higherside'];
+const VALID_STRATEGIES: StrategyType[] = ['fallback', 'ninetynine', 'martingale', 'higherside', 'scalp60'];
 
 const eventType = process.argv[2];
 const strategyArg = process.argv[3] as StrategyType | undefined;

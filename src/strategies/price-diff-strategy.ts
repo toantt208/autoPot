@@ -45,11 +45,13 @@ export const DEFAULT_TIERED_THRESHOLDS: TieredThreshold[] = [
   { maxTimeLeft: 100, threshold: 0.0015 },  // Last 100s: 0.0015
   { maxTimeLeft: 150, threshold: 0.002 },   // Last 150s: 0.002
   { maxTimeLeft: 300, threshold: 0.004 },   // Last 5min: 0.004
-  { maxTimeLeft: 600, threshold: 0.006 },   // Last 10min: 0.006
+  { maxTimeLeft: 600, threshold: 0.01 },    // Last 10min: 0.01
 ];
 
-// Minimum entry price (only buy if market price > this value)
-export const DEFAULT_MIN_ENTRY_PRICE = 0.80; // 80%
+// Minimum entry price based on time remaining
+export const DEFAULT_MIN_ENTRY_PRICE = 0.65; // 65% for normal entries
+export const LATE_MIN_ENTRY_PRICE = 0.55; // 55% for last 30s
+export const LATE_ENTRY_TIME_THRESHOLD = 30; // Switch to lower min price at 30s
 
 export interface PriceDiffStrategyConfig {
   symbol: string; // e.g., 'XRP'
@@ -308,8 +310,9 @@ export async function executePriceDiffStrategy(
     const entryPrice = entrySide === 'UP' ? snapshot.upPrice : snapshot.downPrice;
     const entryTokenId = entrySide === 'UP' ? tokenIds.up : tokenIds.down;
 
-    // Check if entry price meets minimum requirement
-    if (entryPrice < minEntryPrice) {
+    // Check if entry price meets minimum requirement (dynamic based on time)
+    const effectiveMinPrice = timeLeft < LATE_ENTRY_TIME_THRESHOLD ? LATE_MIN_ENTRY_PRICE : minEntryPrice;
+    if (entryPrice < effectiveMinPrice) {
       // Log periodically
       if (Math.random() < 0.2) {
         logger.debug(
@@ -317,7 +320,7 @@ export async function executePriceDiffStrategy(
             slug: window.slug,
             side: entrySide,
             entryPrice: `${(entryPrice * 100).toFixed(1)}%`,
-            minRequired: `${(minEntryPrice * 100).toFixed(0)}%`,
+            minRequired: `${(effectiveMinPrice * 100).toFixed(0)}%`,
             priceDiff: `${priceDiff >= 0 ? '+' : ''}${priceDiff.toFixed(4)}`,
             time: timeInfo,
           },

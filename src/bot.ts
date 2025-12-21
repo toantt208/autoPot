@@ -18,8 +18,9 @@ import {
   type MartingaleState,
 } from './strategies/martingale-strategy.js';
 import { processMarketHigherSide } from './strategies/higher-side-strategy.js';
+import { processMarketScalp60 } from './strategies/scalp-60-strategy.js';
 
-export type StrategyType = 'fallback' | 'ninetynine' | 'martingale' | 'higherside';
+export type StrategyType = 'fallback' | 'ninetynine' | 'martingale' | 'higherside' | 'scalp60';
 import {
   calculateMarketWindow,
   getSecondsUntilTradingWindow,
@@ -56,6 +57,7 @@ export async function runBot(options: BotOptions): Promise<void> {
     ninetynine: '99% Strategy',
     martingale: 'Martingale',
     higherside: 'Higher Side (60%+)',
+    scalp60: 'Scalp 60% (+1¢)',
   };
   const strategyName = strategyNames[strategy];
   logger.info({ crypto: cryptoUpper, interval: eventConfig.interval, strategy: strategyName }, `Starting Polymarket ${cryptoUpper} Trading Bot`);
@@ -180,6 +182,14 @@ export async function runBot(options: BotOptions): Promise<void> {
         );
       } else if (strategy === 'higherside') {
         result = await processMarketHigherSide(
+          eventConfig,
+          tradingClient,
+          marketClient,
+          tradeTracker,
+          config
+        );
+      } else if (strategy === 'scalp60') {
+        result = await processMarketScalp60(
           eventConfig,
           tradingClient,
           marketClient,
