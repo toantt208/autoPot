@@ -14,7 +14,7 @@ import { TradingClient } from './clients/trading-client.js';
 
 // CLI arguments
 const TOKEN_ID = "102504892414163237174864879683522880588750452841477290216845150938663289742135";
-const LOOPS = 1;
+const LOOPS = 10;
 const TRADE_AMOUNT = 10;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -44,26 +44,26 @@ async function main(): Promise<void> {
   for (let i = 1; i <= LOOPS; i++) {
     try {
       // Market Buy
-      // const buyResult = await tradingClient.marketBuy({
-      //   tokenId: TOKEN_ID,
-      //   amount: TRADE_AMOUNT,
-      //   negRisk: true,
-      //   tickSize: '0.001',
-      // });
-      //
-      // if (!buyResult.success && buyResult.status !== 'matched') {
-      //   console.log(`#${i}/${LOOPS} | Buy failed: ${(buyResult as any).errorMsg || buyResult.status}`);
-      //   continue;
-      // }
-      //
-      // const tokensReceived = parseFloat((buyResult as any).takingAmount || '0');
-      // if (tokensReceived <= 0) {
-      //   console.log(`#${i}/${LOOPS} | Buy: no tokens received`);
-      //   continue;
-      // }
+      const buyResult = await tradingClient.marketBuy({
+        tokenId: TOKEN_ID,
+        amount: TRADE_AMOUNT,
+        negRisk: true,
+        tickSize: '0.001',
+      });
 
-      // await sleep(2000)
-      const tokensReceived = 2000
+      if (!buyResult.success && buyResult.status !== 'matched') {
+        console.log(`#${i}/${LOOPS} | Buy failed: ${(buyResult as any).errorMsg || buyResult.status}`);
+        continue;
+      }
+
+      const tokensReceived = parseFloat((buyResult as any).takingAmount || '0');
+      if (tokensReceived <= 0) {
+        console.log(`#${i}/${LOOPS} | Buy: no tokens received`);
+        continue;
+      }
+
+      await sleep(10000)
+
       // Market Sell immediately
       const sellResult = await tradingClient.marketSell({
         tokenId: TOKEN_ID,
