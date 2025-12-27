@@ -33,9 +33,9 @@ import type { EventConfig } from '../config/events.js';
 
 // Strategy parameters
 const TRIGGER_PRICE_MIN = 0.70; // 70% minimum trigger
-const TRIGGER_PRICE_MAX = 0.95; // 95% maximum trigger
+const TRIGGER_PRICE_MAX = 0.90; // 90% maximum trigger
 const SELL_PRICE_INCREMENT = 0.01; // 1 cent profit target
-const STOP_LOSS_DROP = 0.30; // Stop-loss if price drops 30 cents from fill price
+const STOP_LOSS_PRICE = 0.20; // Stop-loss if price goes under 20 cents
 const ENTRY_WINDOW_SECONDS = 5 * 60; // Only enter in last 5 minutes
 const POLL_INTERVAL_MS = 1000;
 const ORDER_CHECK_INTERVAL_MS = 2000;
@@ -271,8 +271,8 @@ export async function executeScalp60Strategy(
             if (status === 'MATCHED' || status === 'FILLED' || sizeMatched > 0) {
               // Round down to 2 decimal places to avoid CLOB rounding issues
               state.tokensOwned = Math.floor(sizeMatched * 100) / 100;
-              // Use the order price, not calculated price
-              state.fillPrice = orderPrice > 0 ? orderPrice : (sizeMatched > 0 ? config.BET_AMOUNT_USDC / sizeMatched : 0);
+              // Calculate actual fill price from USDC spent / tokens received
+              state.fillPrice = config.BET_AMOUNT_USDC / sizeMatched;
 
               // Validate fill price is in valid range
               if (state.fillPrice <= 0 || state.fillPrice > 0.99) {
@@ -315,27 +315,52 @@ export async function executeScalp60Strategy(
                   'Placing limit sell order instantly...'
                 );
 
-                const sellOrder = await clobClient.createOrder(
-                  {
-                    tokenID: state.tokenId,
-                    price: sellPrice,
-                    size: state.tokensOwned,
-                    side: Side.SELL,
-                    expiration: 0,
-                  },
-                  {
-                    negRisk: tokenIds.negRisk,
-                    tickSize: tokenIds.tickSize as TickSize,
+                // Retry loop for limit sell order
+                let sellOrderPlaced = false;
+                let retryCount = 0;
+                while (!sellOrderPlaced) {
+                  try {
+                    const sellOrder = await clobClient.createOrder(
+                      {
+                        tokenID: state.tokenId,
+                        price: sellPrice,
+                        size: state.tokensOwned,
+                        side: Side.SELL,
+                        expiration: 0,
+                      },
+                      {
+                        negRisk: tokenIds.negRisk,
+                        tickSize: tokenIds.tickSize as TickSize,
+                      }
+                    );
+
+                    const result = await clobClient.postOrder(sellOrder, OrderType.GTC);
+
+                    if ((result as any).orderID) {
+                      state.sellOrderId = (result as any).orderID;
+                      sellOrderPlaced = true;
+                      logger.info(
+                        { orderId: state.sellOrderId, price: sellPrice },
+                        'Limit sell order placed instantly'
+                      );
+                    } else {
+                      const errorMsg = (result as any).errorMsg || (result as any).error || 'Unknown error';
+                      retryCount++;
+                      logger.warn(
+                        { error: errorMsg, retry: retryCount },
+                        'Limit sell order failed, retrying in 2s...'
+                      );
+                      await sleep(2000);
+                    }
+                  } catch (error: any) {
+                    retryCount++;
+                    logger.warn(
+                      { error: error.message, retry: retryCount },
+                      'Limit sell order error, retrying in 2s...'
+                    );
+                    await sleep(2000);
                   }
-                );
-
-                const result = await clobClient.postOrder(sellOrder, OrderType.GTC);
-                state.sellOrderId = (result as any).orderID;
-
-                logger.info(
-                  { orderId: state.sellOrderId, price: sellPrice },
-                  'Limit sell order placed instantly'
-                );
+                }
               }
 
               state.phase = 'selling';
@@ -352,24 +377,21 @@ export async function executeScalp60Strategy(
       }
 
       case 'selling': {
-        // Calculate stop-loss price
-        const stopLossPrice = state.fillPrice - STOP_LOSS_DROP;
-
         // Check current price for stop-loss
         const currentPrice = state.side === 'UP' ? upPrice : downPrice;
 
-        // Check stop-loss condition
-        if (currentPrice <= stopLossPrice && state.tokensOwned > 0 && state.tokenId) {
+        // Check stop-loss condition - trigger if price goes under 20 cents
+        if (currentPrice < STOP_LOSS_PRICE && state.tokensOwned > 0 && state.tokenId) {
           logger.warn(
             {
               side: state.side,
               fillPrice: `${(state.fillPrice * 100).toFixed(1)}%`,
               currentPrice: `${(currentPrice * 100).toFixed(1)}%`,
-              stopLossPrice: `${(stopLossPrice * 100).toFixed(1)}%`,
+              stopLossPrice: `${(STOP_LOSS_PRICE * 100).toFixed(0)}%`,
               tokens: state.tokensOwned.toFixed(4),
               slug: window.slug,
             },
-            'STOP-LOSS TRIGGERED! Market selling...'
+            'STOP-LOSS TRIGGERED! Price under 20 cents, market selling...'
           );
 
           // Cancel existing limit sell order if any
@@ -382,30 +404,50 @@ export async function executeScalp60Strategy(
             }
           }
 
-          // Market sell to cut losses
+          // Market sell to cut losses - retry until success
           if (!config.DRY_RUN) {
-            try {
-              const sellResult = await tradingClient.marketSell({
-                tokenId: state.tokenId,
-                amount: state.tokensOwned,
-                negRisk: tokenIds.negRisk,
-                tickSize: tokenIds.tickSize,
-              });
+            let stopLossSold = false;
+            let retryCount = 0;
+            while (!stopLossSold) {
+              try {
+                const sellResult = await tradingClient.marketSell({
+                  tokenId: state.tokenId,
+                  amount: state.tokensOwned,
+                  negRisk: tokenIds.negRisk,
+                  tickSize: tokenIds.tickSize,
+                });
 
-              const loss = (state.fillPrice - currentPrice) * state.tokensOwned;
-              logger.warn(
-                {
-                  side: state.side,
-                  buyPrice: `${(state.fillPrice * 100).toFixed(1)}%`,
-                  sellPrice: `${(currentPrice * 100).toFixed(1)}%`,
-                  loss: `-$${loss.toFixed(4)}`,
-                  sellResult: sellResult.status,
-                  slug: window.slug,
-                },
-                'STOP-LOSS EXECUTED'
-              );
-            } catch (error: any) {
-              logger.error({ error: error.message }, 'Error executing stop-loss market sell');
+                if (sellResult.success || sellResult.status === 'matched') {
+                  stopLossSold = true;
+                  const loss = (state.fillPrice - currentPrice) * state.tokensOwned;
+                  logger.warn(
+                    {
+                      side: state.side,
+                      buyPrice: `${(state.fillPrice * 100).toFixed(1)}%`,
+                      sellPrice: `${(currentPrice * 100).toFixed(1)}%`,
+                      loss: `-$${loss.toFixed(4)}`,
+                      sellResult: sellResult.status,
+                      slug: window.slug,
+                    },
+                    'STOP-LOSS EXECUTED'
+                  );
+                } else {
+                  const errorMsg = (sellResult as any).errorMsg || sellResult.status || 'Unknown error';
+                  retryCount++;
+                  logger.warn(
+                    { error: errorMsg, retry: retryCount },
+                    'Stop-loss market sell failed, retrying in 2s...'
+                  );
+                  await sleep(2000);
+                }
+              } catch (error: any) {
+                retryCount++;
+                logger.warn(
+                  { error: error.message, retry: retryCount },
+                  'Stop-loss market sell error, retrying in 2s...'
+                );
+                await sleep(2000);
+              }
             }
           } else {
             const loss = (state.fillPrice - currentPrice) * state.tokensOwned;
@@ -433,7 +475,7 @@ export async function executeScalp60Strategy(
               tokens: state.tokensOwned.toFixed(4),
               fillPrice: `${(state.fillPrice * 100).toFixed(1)}%`,
               sellPrice: `${(sellPrice * 100).toFixed(0)}%`,
-              stopLoss: `${(stopLossPrice * 100).toFixed(0)}%`,
+              stopLoss: `${(STOP_LOSS_PRICE * 100).toFixed(0)}%`,
               expectedProfit: `$${(SELL_PRICE_INCREMENT * state.tokensOwned).toFixed(4)}`,
               slug: window.slug,
             },
@@ -441,27 +483,52 @@ export async function executeScalp60Strategy(
           );
 
           if (!config.DRY_RUN) {
-            const sellOrder = await clobClient.createOrder(
-              {
-                tokenID: state.tokenId,
-                price: sellPrice,
-                size: state.tokensOwned,
-                side: Side.SELL,
-                expiration: 0,
-              },
-              {
-                negRisk: tokenIds.negRisk,
-                tickSize: tokenIds.tickSize as TickSize,
+            // Retry loop for limit sell order
+            let sellOrderPlaced = false;
+            let retryCount = 0;
+            while (!sellOrderPlaced) {
+              try {
+                const sellOrder = await clobClient.createOrder(
+                  {
+                    tokenID: state.tokenId,
+                    price: sellPrice,
+                    size: state.tokensOwned,
+                    side: Side.SELL,
+                    expiration: 0,
+                  },
+                  {
+                    negRisk: tokenIds.negRisk,
+                    tickSize: tokenIds.tickSize as TickSize,
+                  }
+                );
+
+                const result = await clobClient.postOrder(sellOrder, OrderType.GTC);
+
+                if ((result as any).orderID) {
+                  state.sellOrderId = (result as any).orderID;
+                  sellOrderPlaced = true;
+                  logger.info(
+                    { orderId: state.sellOrderId, price: sellPrice },
+                    'Limit sell order placed'
+                  );
+                } else {
+                  const errorMsg = (result as any).errorMsg || (result as any).error || 'Unknown error';
+                  retryCount++;
+                  logger.warn(
+                    { error: errorMsg, retry: retryCount },
+                    'Limit sell order failed, retrying in 2s...'
+                  );
+                  await sleep(2000);
+                }
+              } catch (error: any) {
+                retryCount++;
+                logger.warn(
+                  { error: error.message, retry: retryCount },
+                  'Limit sell order error, retrying in 2s...'
+                );
+                await sleep(2000);
               }
-            );
-
-            const result = await clobClient.postOrder(sellOrder, OrderType.GTC);
-            state.sellOrderId = (result as any).orderID;
-
-            logger.info(
-              { orderId: state.sellOrderId, price: sellPrice },
-              'Limit sell order placed'
-            );
+            }
           } else {
             state.sellOrderId = 'dry-run';
           }

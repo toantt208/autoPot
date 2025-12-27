@@ -32,6 +32,10 @@ const POLL_INTERVAL_MS = 500;
 /**
  * Fetch market prices without requiring full trading credentials
  * Uses the public CLOB prices endpoint
+ *
+ * Returns SELL prices (ask) - the price we pay when BUYING tokens
+ * BUY price = bid (what market pays us when we sell)
+ * SELL price = ask (what we pay when we buy)
  */
 async function fetchMarketPrices(
   upTokenId: string,
@@ -41,8 +45,8 @@ async function fetchMarketPrices(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify([
-      { token_id: upTokenId, side: 'BUY' },
-      { token_id: downTokenId, side: 'BUY' },
+      { token_id: upTokenId, side: 'SELL' },
+      { token_id: downTokenId, side: 'SELL' },
     ]),
   });
 
@@ -53,8 +57,9 @@ async function fetchMarketPrices(
   const data = await response.json() as Record<string, { BUY?: string; SELL?: string }>;
 
   // Response format: { "token_id": { "BUY": "0.7", "SELL": "0.8" }, ... }
-  const upPrice = parseFloat(data[upTokenId]?.BUY || '0');
-  const downPrice = parseFloat(data[downTokenId]?.BUY || '0');
+  // Use SELL price (ask) - this is what we pay when buying
+  const upPrice = parseFloat(data[upTokenId]?.SELL || '0');
+  const downPrice = parseFloat(data[downTokenId]?.SELL || '0');
 
   return { upPrice, downPrice };
 }

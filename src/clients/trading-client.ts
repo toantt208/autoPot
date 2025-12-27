@@ -186,6 +186,10 @@ export class TradingClient {
   /**
    * Get batch prices for multiple tokens in one API call
    * Uses POST /prices endpoint to avoid rate limiting
+   *
+   * Returns SELL prices (ask) - the price we pay when BUYING tokens
+   * BUY price = bid (what market pays us when we sell)
+   * SELL price = ask (what we pay when we buy)
    */
   async getBatchPrices(upTokenId: string, downTokenId: string): Promise<{ upPrice: number; downPrice: number }> {
     try {
@@ -193,8 +197,8 @@ export class TradingClient {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify([
-          { token_id: upTokenId, side: 'BUY' },
-          { token_id: downTokenId, side: 'BUY' },
+          { token_id: upTokenId, side: 'SELL' },
+          { token_id: downTokenId, side: 'SELL' },
         ]),
       });
 
@@ -205,10 +209,11 @@ export class TradingClient {
       const data = await response.json();
       console.log(data);
       // Response format: { "token_id": { "BUY": "0.7", "SELL": "0.8" }, ... }
-      const upPrice = parseFloat(data[upTokenId]?.BUY || '0');
-      const downPrice = parseFloat(data[downTokenId]?.BUY || '0');
+      // Use SELL price (ask) - this is what we pay when buying
+      const upPrice = parseFloat(data[upTokenId]?.SELL || '0');
+      const downPrice = parseFloat(data[downTokenId]?.SELL || '0');
 
-      logger.debug({ upPrice, downPrice }, 'Batch prices fetched');
+      logger.debug({ upPrice, downPrice }, 'Batch prices fetched (SELL/ask)');
       return { upPrice, downPrice };
     } catch (error: any) {
       logger.warn({ error: error?.message }, 'Error fetching batch prices');

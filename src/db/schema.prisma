@@ -216,3 +216,305 @@ model MartingaleTrade {
   @@index([createdAt(sort: Desc)])
   @@map("martingale_trades")
 }
+
+// ===========================================
+// ARBITRAGE LOGS
+// ===========================================
+
+model ArbitrageLog {
+  id              BigInt   @id @default(autoincrement())
+
+  // Window info
+  marketSlug      String   @map("market_slug") @db.VarChar(100)
+  crypto          String   @db.VarChar(10)
+
+  // Price snapshot
+  timestamp       DateTime @db.Timestamptz
+  upPrice         Decimal  @map("up_price") @db.Decimal(5, 4)
+  downPrice       Decimal  @map("down_price") @db.Decimal(5, 4)
+  totalPrice      Decimal  @map("total_price") @db.Decimal(5, 4)
+  profitPercent   Decimal  @map("profit_percent") @db.Decimal(6, 4)  // e.g., 0.0526 = 5.26%
+
+  // Action taken: PRICE_CHECK, OPPORTUNITY, SIMULATED_BUY
+  action          String   @db.VarChar(20)
+
+  // Simulated trade details (only for OPPORTUNITY/SIMULATED_BUY)
+  upSpend         Decimal? @map("up_spend") @db.Decimal(10, 2)
+  downSpend       Decimal? @map("down_spend") @db.Decimal(10, 2)
+  tokens          Decimal? @db.Decimal(10, 4)
+  expectedProfit  Decimal? @map("expected_profit") @db.Decimal(10, 2)
+
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([marketSlug])
+  @@index([crypto])
+  @@index([action])
+  @@index([createdAt(sort: Desc)])
+  @@map("arbitrage_logs")
+}
+
+// ===========================================
+// ARBITRAGE V2 - TWO-STEP STRATEGY
+// ===========================================
+
+model ArbitragePosition {
+  id              BigInt   @id @default(autoincrement())
+
+  // Window info
+  marketSlug      String   @unique @map("market_slug") @db.VarChar(100)
+  crypto          String   @db.VarChar(10)
+
+  // First leg (higher side)
+  firstSide       String   @map("first_side") @db.VarChar(4)  // UP or DOWN
+  firstPrice      Decimal  @map("first_price") @db.Decimal(5, 4)
+  firstSpend      Decimal  @map("first_spend") @db.Decimal(10, 2)
+  firstTokens     Decimal  @map("first_tokens") @db.Decimal(10, 4)
+  firstOrderId    String?  @map("first_order_id") @db.VarChar(100)
+  firstBuyTime    DateTime @map("first_buy_time") @db.Timestamptz
+
+  // Second leg (hedge)
+  hedgeTargetPrice Decimal? @map("hedge_target_price") @db.Decimal(5, 4)
+  hedgeSide        String?  @map("hedge_side") @db.VarChar(4)
+  hedgePrice       Decimal? @map("hedge_price") @db.Decimal(5, 4)
+  hedgeSpend       Decimal? @map("hedge_spend") @db.Decimal(10, 2)
+  hedgeTokens      Decimal? @map("hedge_tokens") @db.Decimal(10, 4)
+  hedgeOrderId     String?  @map("hedge_order_id") @db.VarChar(100)
+  hedgeBuyTime     DateTime? @map("hedge_buy_time") @db.Timestamptz
+
+  // Status: WAITING_HEDGE, HEDGED, RESOLVED, EXPIRED
+  status          String   @db.VarChar(20)
+
+  // Resolution
+  winnerSide      String?  @map("winner_side") @db.VarChar(4)
+  totalSpend      Decimal? @map("total_spend") @db.Decimal(10, 2)
+  totalTokens     Decimal? @map("total_tokens") @db.Decimal(10, 4)
+  payout          Decimal? @db.Decimal(10, 2)
+  profitUsd       Decimal? @map("profit_usd") @db.Decimal(10, 2)
+
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  resolvedAt      DateTime? @map("resolved_at") @db.Timestamptz
+
+  @@index([crypto])
+  @@index([status])
+  @@index([createdAt(sort: Desc)])
+  @@map("arbitrage_positions")
+}
+
+model ArbitrageSession {
+  id              BigInt   @id @default(autoincrement())
+  crypto          String   @db.VarChar(10)
+  startedAt       DateTime @map("started_at") @db.Timestamptz
+  endedAt         DateTime? @map("ended_at") @db.Timestamptz
+
+  totalTrades     Int      @default(0) @map("total_trades")
+  wins            Int      @default(0)
+  losses          Int      @default(0)
+  totalSpend      Decimal  @default(0) @map("total_spend") @db.Decimal(10, 2)
+  totalPayout     Decimal  @default(0) @map("total_payout") @db.Decimal(10, 2)
+  cumulativeProfit Decimal @default(0) @map("cumulative_profit") @db.Decimal(10, 2)
+  profitThreshold Decimal  @map("profit_threshold") @db.Decimal(10, 2)
+
+  active          Boolean  @default(true)
+
+  @@index([crypto])
+  @@index([active])
+  @@map("arbitrage_sessions")
+}
+
+// Detailed trade log for each buy action
+model ArbitrageTradeLog {
+  id              BigInt   @id @default(autoincrement())
+  marketSlug      String   @map("market_slug") @db.VarChar(100)
+  crypto          String   @db.VarChar(10)
+  timestamp       DateTime @db.Timestamptz
+
+  // Current prices when decision made
+  upPrice         Decimal  @map("up_price") @db.Decimal(5, 4)
+  downPrice       Decimal  @map("down_price") @db.Decimal(5, 4)
+  timeLeft        Int      @map("time_left")
+
+  // Action taken
+  action          String   @db.VarChar(20)  // BUY_UP, BUY_DOWN, BUY_BOTH, HOLD, EMERGENCY
+  reason          String   @db.VarChar(200)
+
+  // Trade details (if action is BUY)
+  side            String?  @db.VarChar(4)   // UP or DOWN
+  amount          Decimal? @db.Decimal(10, 2)
+  tokens          Decimal? @db.Decimal(10, 4)
+  price           Decimal? @db.Decimal(5, 4)
+
+  // State after trade
+  upTokens        Decimal  @map("up_tokens") @db.Decimal(10, 4)
+  upSpent         Decimal  @map("up_spent") @db.Decimal(10, 2)
+  downTokens      Decimal  @map("down_tokens") @db.Decimal(10, 4)
+  downSpent       Decimal  @map("down_spent") @db.Decimal(10, 2)
+  avgUpPrice      Decimal? @map("avg_up_price") @db.Decimal(5, 4)
+  avgDownPrice    Decimal? @map("avg_down_price") @db.Decimal(5, 4)
+  avgTotal        Decimal? @map("avg_total") @db.Decimal(5, 4)
+  guaranteed      Decimal  @db.Decimal(10, 4)
+  expectedProfit  Decimal  @map("expected_profit") @db.Decimal(10, 2)
+
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([marketSlug])
+  @@index([crypto])
+  @@index([action])
+  @@index([createdAt(sort: Desc)])
+  @@map("arbitrage_trade_logs")
+}
+
+// Window summary for stats
+model ArbitrageWindowStats {
+  id              BigInt   @id @default(autoincrement())
+  marketSlug      String   @unique @map("market_slug") @db.VarChar(100)
+  crypto          String   @db.VarChar(10)
+  windowStart     DateTime @map("window_start") @db.Timestamptz
+
+  // Entry
+  entryTime       DateTime? @map("entry_time") @db.Timestamptz
+  entrySide       String?  @map("entry_side") @db.VarChar(4)
+  entryPrice      Decimal? @map("entry_price") @db.Decimal(5, 4)
+
+  // Hedge
+  hedgeTime       DateTime? @map("hedge_time") @db.Timestamptz
+  hedgePrice      Decimal? @map("hedge_price") @db.Decimal(5, 4)
+  hedgeWasEmergency Boolean @default(false) @map("hedge_was_emergency")
+
+  // Final state
+  totalBuys       Int      @default(0) @map("total_buys")
+  upTokens        Decimal  @default(0) @map("up_tokens") @db.Decimal(10, 4)
+  upSpent         Decimal  @default(0) @map("up_spent") @db.Decimal(10, 2)
+  downTokens      Decimal  @default(0) @map("down_tokens") @db.Decimal(10, 4)
+  downSpent       Decimal  @default(0) @map("down_spent") @db.Decimal(10, 2)
+  avgTotal        Decimal? @map("avg_total") @db.Decimal(5, 4)
+  guaranteed      Decimal  @default(0) @db.Decimal(10, 4)
+  totalSpent      Decimal  @default(0) @map("total_spent") @db.Decimal(10, 2)
+  profitUsd       Decimal? @map("profit_usd") @db.Decimal(10, 2)
+  profitPct       Decimal? @map("profit_pct") @db.Decimal(6, 2)
+
+  // Status
+  status          String   @db.VarChar(20)  // ACTIVE, HEDGED, RESOLVED, EXPIRED
+
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  resolvedAt      DateTime? @map("resolved_at") @db.Timestamptz
+
+  @@index([crypto])
+  @@index([status])
+  @@index([createdAt(sort: Desc)])
+  @@map("arbitrage_window_stats")
+}
+
+// ===========================================
+// AVWA STRATEGY (Adaptive Volume-Weighted Arbitrage)
+// ===========================================
+
+model AvwaPosition {
+  id              BigInt   @id @default(autoincrement())
+
+  // Window identification
+  marketSlug      String   @unique @map("market_slug") @db.VarChar(100)
+  crypto          String   @db.VarChar(10)
+
+  // Capital allocation (used amounts)
+  initialPoolUsed  Decimal  @default(0) @map("initial_pool_used") @db.Decimal(10, 2)
+  dcaPoolUsed      Decimal  @default(0) @map("dca_pool_used") @db.Decimal(10, 2)
+  sniperPoolUsed   Decimal  @default(0) @map("sniper_pool_used") @db.Decimal(10, 2)
+
+  // Primary position (higher probability side)
+  primarySide      String   @map("primary_side") @db.VarChar(4)  // UP or DOWN
+  primaryTokens    Decimal  @default(0) @map("primary_tokens") @db.Decimal(10, 4)
+  primarySpent     Decimal  @default(0) @map("primary_spent") @db.Decimal(10, 2)
+  primaryAvgPrice  Decimal? @map("primary_avg_price") @db.Decimal(5, 4)
+
+  // Hedge position (opposite side for arbitrage lock)
+  hedgeTokens      Decimal  @default(0) @map("hedge_tokens") @db.Decimal(10, 4)
+  hedgeSpent       Decimal  @default(0) @map("hedge_spent") @db.Decimal(10, 2)
+  hedgeAvgPrice    Decimal? @map("hedge_avg_price") @db.Decimal(5, 4)
+
+  // DCA tracking
+  dcaLevel         Int      @default(0) @map("dca_level")  // 0-5 levels
+  dcaTriggerPrices Json?    @map("dca_trigger_prices")     // Array of trigger prices
+  lastDcaPrice     Decimal? @map("last_dca_price") @db.Decimal(5, 4)
+
+  // Arbitrage metrics
+  arbitrageLocked  Boolean  @default(false) @map("arbitrage_locked")
+  guaranteedTokens Decimal  @default(0) @map("guaranteed_tokens") @db.Decimal(10, 4)
+  expectedProfit   Decimal? @map("expected_profit") @db.Decimal(10, 2)
+
+  // Phase: WAITING, ENTRY, DCA, SNIPER_READY, LOCKING, LOCKED, RESOLVED
+  phase            String   @db.VarChar(20)
+  // Status: ACTIVE, COMPLETED, EXPIRED
+  status           String   @db.VarChar(20)
+
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  resolvedAt       DateTime? @map("resolved_at") @db.Timestamptz
+
+  trades           AvwaTrade[]
+
+  @@index([crypto])
+  @@index([status])
+  @@index([phase])
+  @@index([createdAt(sort: Desc)])
+  @@map("avwa_positions")
+}
+
+model AvwaTrade {
+  id              BigInt   @id @default(autoincrement())
+  positionId      BigInt   @map("position_id")
+
+  // Trade details
+  side            String   @db.VarChar(4)      // UP or DOWN
+  pool            String   @db.VarChar(10)     // INITIAL, DCA, SNIPER
+  amount          Decimal  @db.Decimal(10, 2)  // USDC spent
+  tokens          Decimal  @db.Decimal(10, 4)  // Tokens received
+  price           Decimal  @db.Decimal(5, 4)   // Execution price
+
+  // Iceberg tracking
+  isIceberg       Boolean  @default(false) @map("is_iceberg")
+  icebergChunks   Int?     @map("iceberg_chunks")
+  icebergIndex    Int?     @map("iceberg_index")
+
+  // Order details
+  orderType       String   @map("order_type") @db.VarChar(10)  // MARKET, LIMIT, ICEBERG
+  orderId         String?  @map("order_id") @db.VarChar(100)
+  slippage        Decimal? @db.Decimal(5, 4)
+
+  // DCA level (if applicable)
+  dcaLevel        Int?     @map("dca_level")
+
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  position        AvwaPosition @relation(fields: [positionId], references: [id], onDelete: Cascade)
+
+  @@index([positionId])
+  @@index([pool])
+  @@index([createdAt(sort: Desc)])
+  @@map("avwa_trades")
+}
+
+model AvwaSession {
+  id              BigInt   @id @default(autoincrement())
+  crypto          String   @db.VarChar(10)
+  startedAt       DateTime @map("started_at") @db.Timestamptz
+  endedAt         DateTime? @map("ended_at") @db.Timestamptz
+
+  // Capital config
+  totalCapital    Decimal  @map("total_capital") @db.Decimal(10, 2)
+  initialPool     Decimal  @map("initial_pool") @db.Decimal(10, 2)
+  dcaPool         Decimal  @map("dca_pool") @db.Decimal(10, 2)
+  sniperPool      Decimal  @map("sniper_pool") @db.Decimal(10, 2)
+
+  // Performance
+  totalTrades     Int      @default(0) @map("total_trades")
+  arbitrageLocks  Int      @default(0) @map("arbitrage_locks")
+  totalSpent      Decimal  @default(0) @map("total_spent") @db.Decimal(10, 2)
+  totalPayout     Decimal  @default(0) @map("total_payout") @db.Decimal(10, 2)
+  cumulativeProfit Decimal @default(0) @map("cumulative_profit") @db.Decimal(10, 2)
+
+  active          Boolean  @default(true)
+
+  @@index([crypto])
+  @@index([active])
+  @@map("avwa_sessions")
+}

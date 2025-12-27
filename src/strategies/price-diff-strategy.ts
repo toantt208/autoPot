@@ -10,6 +10,10 @@
 
 import { TradingClient } from '../clients/trading-client.js';
 import { MarketClient } from '../clients/market-client.js';
+import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
+import type { ApiKeyCreds, TickSize } from '@polymarket/clob-client';
+import { SignatureType } from '@polymarket/order-utils';
+import { Wallet } from '@ethersproject/wallet';
 import { logger } from '../utils/logger.js';
 import { fetchPrices } from '../services/price-monitor.js';
 import { sleep } from '../utils/retry.js';
@@ -26,6 +30,9 @@ import {
 import type { MarketWindow, TokenIds, TradeResult } from '../types/index.js';
 import type { Config } from '../config/index.js';
 import type { EventConfig } from '../config/events.js';
+
+const CLOB_HOST = 'https://clob.polymarket.com';
+const POLYGON_CHAIN_ID = 137;
 
 // Strategy parameters
 const POLL_INTERVAL_MS = 200; // Check every 200ms for fast entry
@@ -48,15 +55,136 @@ export const DEFAULT_TIERED_THRESHOLDS: TieredThreshold[] = [
   { maxTimeLeft: 600, threshold: 0.01 },    // Last 10min: 0.01
 ];
 
-// Minimum entry price based on time remaining
-export const DEFAULT_MIN_ENTRY_PRICE = 0.65; // 65% for normal entries
+// Entry price constraints
+export const DEFAULT_MIN_ENTRY_PRICE = 0.60; // 60% minimum
+export const DEFAULT_MAX_ENTRY_PRICE = 0.90; // 90% maximum
 export const LATE_MIN_ENTRY_PRICE = 0.55; // 55% for last 30s
 export const LATE_ENTRY_TIME_THRESHOLD = 30; // Switch to lower min price at 30s
+
+/**
+ * Create CLOB client for limit orders
+ */
+function createClobClient(config: Config): ClobClient {
+  const wallet = new Wallet(config.MASTER_PRIVATE_KEY);
+  const creds: ApiKeyCreds = {
+    key: config.CLOB_API_KEY,
+    secret: config.CLOB_SECRET,
+    passphrase: config.CLOB_PASSPHRASE,
+  };
+
+  return new ClobClient(
+    CLOB_HOST,
+    POLYGON_CHAIN_ID,
+    wallet,
+    creds,
+    SignatureType.POLY_GNOSIS_SAFE,
+    config.GNOSIS_SAFE_ADDRESS
+  );
+}
+
+/**
+ * Place a limit sell order at 1 cent higher than buy price
+ */
+async function placeLimitSellOneCentHigher(
+  clobClient: ClobClient,
+  tokenId: string,
+  tokensOwned: number,
+  negRisk: boolean,
+  tickSize: string,
+  slug: string,
+  buyPrice: number
+): Promise<string | null> {
+  // Sell at 1 cent higher than buy price (e.g., bought at 70%, sell at 71%)
+  const sellPrice = Math.round((buyPrice + 0.01) * 100) / 100;
+  // Round down tokens to avoid dust issues
+  const tokensToSell = Math.floor(tokensOwned * 100) / 100;
+
+  if (tokensToSell <= 0) {
+    logger.warn({ tokensOwned, slug }, 'No tokens to sell');
+    return null;
+  }
+
+  if (sellPrice > 0.99) {
+    logger.info({ buyPrice, sellPrice, slug }, 'Sell price would be > 99%, skipping limit order');
+    return null;
+  }
+
+  logger.info(
+    { tokens: tokensToSell, buyPrice: `${(buyPrice * 100).toFixed(0)}%`, sellPrice: `${(sellPrice * 100).toFixed(0)}%`, slug },
+    'Placing limit sell order at +1 cent...'
+  );
+
+  // Retry with max attempts
+  const MAX_RETRIES = 5;
+  let retryCount = 0;
+
+  while (retryCount < MAX_RETRIES) {
+    try {
+      const sellOrder = await clobClient.createOrder(
+        {
+          tokenID: tokenId,
+          price: sellPrice,
+          size: tokensToSell,
+          side: Side.SELL,
+          expiration: 0,
+        },
+        {
+          negRisk,
+          tickSize: tickSize as TickSize,
+        }
+      );
+
+      const result = await clobClient.postOrder(sellOrder, OrderType.GTC);
+
+      if ((result as any).orderID) {
+        logger.info(
+          { orderId: (result as any).orderID, buyPrice: `${(buyPrice * 100).toFixed(0)}%`, sellPrice: `${(sellPrice * 100).toFixed(0)}%`, tokens: tokensToSell, slug },
+          'Limit sell order placed'
+        );
+        return (result as any).orderID;
+      } else {
+        const errorMsg = (result as any).errorMsg || (result as any).error || 'Unknown error';
+
+        // Stop retrying if orderbook doesn't exist (market closed)
+        if (errorMsg.includes('does not exist')) {
+          logger.warn({ error: errorMsg, slug }, 'Orderbook closed, giving up on limit sell');
+          return null;
+        }
+
+        retryCount++;
+        logger.warn(
+          { error: errorMsg, retry: retryCount, maxRetries: MAX_RETRIES, slug },
+          'Limit sell order failed, retrying in 2s...'
+        );
+        await sleep(2000);
+      }
+    } catch (error: any) {
+      const errorMsg = error.message || String(error);
+
+      // Stop retrying if orderbook doesn't exist (market closed)
+      if (errorMsg.includes('does not exist')) {
+        logger.warn({ error: errorMsg, slug }, 'Orderbook closed, giving up on limit sell');
+        return null;
+      }
+
+      retryCount++;
+      logger.warn(
+        { error: errorMsg, retry: retryCount, maxRetries: MAX_RETRIES, slug },
+        'Limit sell order error, retrying in 2s...'
+      );
+      await sleep(2000);
+    }
+  }
+
+  logger.error({ slug, retries: retryCount }, 'Limit sell order failed after max retries');
+  return null;
+}
 
 export interface PriceDiffStrategyConfig {
   symbol: string; // e.g., 'XRP'
   tieredThresholds?: TieredThreshold[]; // Optional, defaults to DEFAULT_TIERED_THRESHOLDS
-  minEntryPrice?: number; // Optional, defaults to DEFAULT_MIN_ENTRY_PRICE (0.80)
+  minEntryPrice?: number; // Optional, defaults to DEFAULT_MIN_ENTRY_PRICE (0.60)
+  maxEntryPrice?: number; // Optional, defaults to DEFAULT_MAX_ENTRY_PRICE (0.90)
   priceDiffThreshold?: number; // Deprecated: use tieredThresholds instead
 }
 
@@ -134,7 +262,7 @@ async function tryBuy(
   tickSize: string,
   side: string,
   slug: string
-): Promise<{ matched: boolean; orderId?: string; txHash?: string; error?: string }> {
+): Promise<{ matched: boolean; orderId?: string; txHash?: string; error?: string; tokensReceived?: number; fillPrice?: number }> {
   try {
     const result = await tradingClient.marketBuy({
       tokenId,
@@ -150,11 +278,21 @@ async function tryBuy(
     );
 
     if (txHash) {
-      return { matched: true, orderId: result.orderID, txHash };
+      // Calculate actual fill price: USDC spent / tokens received
+      const tokensReceived = parseFloat((result as any).takingAmount || '0');
+      const usdcSpent = parseFloat((result as any).makingAmount || String(amount));
+      // Round down fill price to 2 decimal places (e.g., 0.70)
+      const fillPrice = tokensReceived > 0 ? Math.floor((usdcSpent / tokensReceived) * 100) / 100 : 0;
+
+      logger.info(
+        { orderId: result.orderID, txHash, side, slug, tokensReceived, fillPrice: `${(fillPrice * 100).toFixed(0)}%` },
+        'Buy success!'
+      );
+      return { matched: true, orderId: result.orderID, txHash, tokensReceived, fillPrice };
     }
 
     if (result.status === 'DRY_RUN') {
-      return { matched: true, orderId: result.orderID };
+      return { matched: true, orderId: result.orderID, tokensReceived: amount / 0.70, fillPrice: 0.70 };
     }
 
     return { matched: false, orderId: result.orderID, error: result.error };
@@ -195,8 +333,12 @@ export async function executePriceDiffStrategy(
     symbol,
     tieredThresholds = DEFAULT_TIERED_THRESHOLDS,
     minEntryPrice = DEFAULT_MIN_ENTRY_PRICE,
+    maxEntryPrice = DEFAULT_MAX_ENTRY_PRICE,
   } = strategyConfig;
   const retryDeadline = window.marketCloseTime + RETRY_AFTER_CLOSE_SECS;
+
+  // Create CLOB client for limit sell orders
+  const clobClient = createClobClient(config);
 
   // Get max time window for logging
   const maxTimeWindow = Math.max(...tieredThresholds.map(t => t.maxTimeLeft));
@@ -206,6 +348,7 @@ export async function executePriceDiffStrategy(
       window: formatWindowInfo(window, Math.floor(Date.now() / 1000)),
       thresholds: tieredThresholds.map(t => `T-${t.maxTimeLeft}s: ${t.threshold}`),
       minEntryPrice: `${(minEntryPrice * 100).toFixed(0)}%`,
+      maxEntryPrice: `${(maxEntryPrice * 100).toFixed(0)}%`,
       symbol,
       strategy: 'price-diff-tiered',
     },
@@ -331,6 +474,26 @@ export async function executePriceDiffStrategy(
       continue;
     }
 
+    // Check if entry price exceeds maximum (too expensive, likely to lose)
+    if (entryPrice > maxEntryPrice) {
+      // Log periodically
+      if (Math.random() < 0.2) {
+        logger.debug(
+          {
+            slug: window.slug,
+            side: entrySide,
+            entryPrice: `${(entryPrice * 100).toFixed(1)}%`,
+            maxAllowed: `${(maxEntryPrice * 100).toFixed(0)}%`,
+            priceDiff: `${priceDiff >= 0 ? '+' : ''}${priceDiff.toFixed(4)}`,
+            time: timeInfo,
+          },
+          'Threshold met but entry price too high, waiting...'
+        );
+      }
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
+
     // Entry price OK, proceed with buy
     logger.info(
       {
@@ -381,11 +544,30 @@ export async function executePriceDiffStrategy(
           txHash: result.txHash,
           side: entrySide,
           entryPrice: `${(entryPrice * 100).toFixed(1)}%`,
+          fillPrice: result.fillPrice ? `${(result.fillPrice * 100).toFixed(0)}%` : 'N/A',
           priceDiff: priceDiff.toFixed(4),
           slug: window.slug,
         },
         'Trade matched!'
       );
+
+      // Place limit sell at +1 cent for profit
+      if (result.fillPrice && result.tokensReceived && !config.DRY_RUN) {
+        logger.info(
+          { fillPrice: `${(result.fillPrice * 100).toFixed(0)}%`, tokens: result.tokensReceived, slug: window.slug },
+          'Placing limit sell at +1 cent for profit'
+        );
+        await placeLimitSellOneCentHigher(
+          clobClient,
+          entryTokenId,
+          result.tokensReceived,
+          tokenIds.negRisk,
+          tokenIds.tickSize,
+          window.slug,
+          result.fillPrice
+        );
+      }
+
       return { marketSlug: window.slug, traded: true, tradeResult };
     }
 

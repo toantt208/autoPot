@@ -1,14 +1,19 @@
 /**
- * 99% Price Strategy
+ * 90-98% Price Strategy
  *
  * Flow (example: BTC 13:00 - 13:15):
- * 1. Active Window (13:13:00 - 13:14:57): Poll for 99% threshold, buy if hit
- * 2. Fallback Window (13:14:57 - 13:15:00): Loop buying higher side until matched
- * 3. Retry Window (13:15:00 - 13:15:05): Keep retrying for 5 seconds after close
+ * In last 88 seconds: If any side is over 90% but under 99%, buy it
+ * After buying, place limit sell at actual fill price + 1 cent
+ *
+ * Skip buying if price hits 99% (no profit margin)
  */
 
 import { TradingClient } from '../clients/trading-client.js';
 import { MarketClient } from '../clients/market-client.js';
+import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
+import type { ApiKeyCreds, TickSize } from '@polymarket/clob-client';
+import { SignatureType } from '@polymarket/order-utils';
+import { Wallet } from '@ethersproject/wallet';
 import { logger } from '../utils/logger.js';
 import { fetchPrices } from '../services/price-monitor.js';
 import { sleep } from '../utils/retry.js';
@@ -22,9 +27,33 @@ import {
 import type { MarketWindow, TokenIds, TradeResult } from '../types/index.js';
 import type { Config } from '../config/index.js';
 import type { EventConfig } from '../config/events.js';
+import { markTradeLock, checkTradeLock } from '../db/redis.js';
 
-const FALLBACK_WINDOW_SECS = 5;   // Last 5 seconds before close
-const RETRY_AFTER_CLOSE_SECS = 5; // 5 seconds after market close
+const MIN_ENTRY_PRICE = 0.90;    // Minimum 90% to buy
+const MAX_ENTRY_PRICE = 0.98;    // Maximum 98% to buy (skip 99%)
+const CLOB_HOST = 'https://clob.polymarket.com';
+const POLYGON_CHAIN_ID = 137;
+
+/**
+ * Create CLOB client for limit orders
+ */
+function createClobClient(config: Config): ClobClient {
+  const wallet = new Wallet(config.MASTER_PRIVATE_KEY);
+  const creds: ApiKeyCreds = {
+    key: config.CLOB_API_KEY,
+    secret: config.CLOB_SECRET,
+    passphrase: config.CLOB_PASSPHRASE,
+  };
+
+  return new ClobClient(
+    CLOB_HOST,
+    POLYGON_CHAIN_ID,
+    wallet,
+    creds,
+    SignatureType.POLY_GNOSIS_SAFE,
+    config.GNOSIS_SAFE_ADDRESS
+  );
+}
 
 /**
  * Check if we're within the market window
@@ -56,7 +85,7 @@ async function tryBuy(
   tickSize: string,
   side: string,
   slug: string
-): Promise<{ matched: boolean; orderId?: string; txHash?: string; error?: string }> {
+): Promise<{ matched: boolean; orderId?: string; txHash?: string; error?: string; tokensReceived?: number; fillPrice?: number }> {
   try {
     const result = await tradingClient.marketBuy({
       tokenId,
@@ -74,13 +103,22 @@ async function tryBuy(
 
     // Success if we have a transaction hash
     if (txHash) {
-      logger.info({ orderId: result.orderID, txHash, side, slug }, 'Buy success (has txHash)! Stopping.');
-      return { matched: true, orderId: result.orderID, txHash };
+      // Calculate actual fill price: USDC spent / tokens received
+      const tokensReceived = parseFloat((result as any).takingAmount || '0');
+      const usdcSpent = parseFloat((result as any).makingAmount || String(amount));
+      // Round down fill price to 2 decimal places (e.g., 0.98)
+      const fillPrice = tokensReceived > 0 ? Math.floor((usdcSpent / tokensReceived) * 100) / 100 : 0;
+
+      logger.info(
+        { orderId: result.orderID, txHash, side, slug, tokensReceived, fillPrice: `${(fillPrice * 100).toFixed(0)}%` },
+        'Buy success (has txHash)!'
+      );
+      return { matched: true, orderId: result.orderID, txHash, tokensReceived, fillPrice };
     }
 
     // Also consider DRY_RUN as success
     if (result.status === 'DRY_RUN') {
-      return { matched: true, orderId: result.orderID };
+      return { matched: true, orderId: result.orderID, tokensReceived: amount / 0.98, fillPrice: 0.98 };
     }
 
     return { matched: false, orderId: result.orderID };
@@ -92,6 +130,104 @@ async function tryBuy(
 }
 
 /**
+ * Place a limit sell order at 1 cent higher than buy price
+ */
+async function placeLimitSellOneCentHigher(
+  clobClient: ClobClient,
+  tokenId: string,
+  tokensOwned: number,
+  negRisk: boolean,
+  tickSize: string,
+  slug: string,
+  buyPrice: number
+): Promise<string | null> {
+  // Sell at 1 cent higher than buy price (e.g., bought at 96%, sell at 97%)
+  const sellPrice = Math.round((buyPrice + 0.01) * 100) / 100;
+  // Round down tokens to avoid dust issues
+  const tokensToSell = Math.floor(tokensOwned * 100) / 100;
+
+  if (tokensToSell <= 0) {
+    logger.warn({ tokensOwned, slug }, 'No tokens to sell');
+    return null;
+  }
+
+  if (sellPrice > 0.99) {
+    logger.info({ buyPrice, sellPrice, slug }, 'Sell price would be > 99%, skipping limit order');
+    return null;
+  }
+
+  logger.info(
+    { tokens: tokensToSell, buyPrice: `${(buyPrice * 100).toFixed(0)}%`, sellPrice: `${(sellPrice * 100).toFixed(0)}%`, slug },
+    'Placing limit sell order at +1 cent...'
+  );
+
+  // Retry with max attempts
+  const MAX_RETRIES = 5;
+  let retryCount = 0;
+
+  while (retryCount < MAX_RETRIES) {
+    try {
+      const sellOrder = await clobClient.createOrder(
+        {
+          tokenID: tokenId,
+          price: sellPrice,
+          size: tokensToSell,
+          side: Side.SELL,
+          expiration: 0,
+        },
+        {
+          negRisk,
+          tickSize: tickSize as TickSize,
+        }
+      );
+
+      const result = await clobClient.postOrder(sellOrder, OrderType.GTC);
+
+      if ((result as any).orderID) {
+        logger.info(
+          { orderId: (result as any).orderID, buyPrice: `${(buyPrice * 100).toFixed(0)}%`, sellPrice: `${(sellPrice * 100).toFixed(0)}%`, tokens: tokensToSell, slug },
+          'Limit sell order placed'
+        );
+        return (result as any).orderID;
+      } else {
+        const errorMsg = (result as any).errorMsg || (result as any).error || 'Unknown error';
+
+        // Stop retrying if orderbook doesn't exist (market closed)
+        if (errorMsg.includes('does not exist')) {
+          logger.warn({ error: errorMsg, slug }, 'Orderbook closed, giving up on limit sell');
+          return null;
+        }
+
+        retryCount++;
+        logger.warn(
+          { error: errorMsg, retry: retryCount, maxRetries: MAX_RETRIES, slug },
+          'Limit sell order failed, retrying in 2s...'
+        );
+        await sleep(2000);
+      }
+    } catch (error: any) {
+      const errorMsg = error.message || String(error);
+
+      // Stop retrying if orderbook doesn't exist (market closed)
+      if (errorMsg.includes('does not exist')) {
+        logger.warn({ error: errorMsg, slug }, 'Orderbook closed, giving up on limit sell');
+        return null;
+      }
+
+      retryCount++;
+      logger.warn(
+        { error: errorMsg, retry: retryCount, maxRetries: MAX_RETRIES, slug },
+        'Limit sell order error, retrying in 2s...'
+      );
+      await sleep(2000);
+    }
+  }
+
+  logger.error({ slug, retries: retryCount }, 'Limit sell order failed after max retries');
+  return null;
+}
+
+/**
  * Execute the 99% strategy for a single market window
  */
 export async function executeStrategy(
@@ -100,14 +236,16 @@ export async function executeStrategy(
   window: MarketWindow,
   tokenIds: TokenIds,
   tradeTracker: TradeTracker,
-  config: Config
+  config: Config,
+  crypto: string = 'UNKNOWN'
 ): Promise<StrategyResult> {
   const now = Math.floor(Date.now() / 1000);
-  const fallbackStart = window.marketCloseTime - FALLBACK_WINDOW_SECS;
-  const retryDeadline = window.marketCloseTime + RETRY_AFTER_CLOSE_SECS;
+
+  // Create CLOB client for limit sell orders
+  const clobClient = createClobClient(config);
 
   logger.info(
-    { window: formatWindowInfo(window, now), threshold: config.MIN_PRICE_THRESHOLD },
+    { window: formatWindowInfo(window, now), minPrice: `${MIN_ENTRY_PRICE * 100}%`, maxPrice: `${MAX_ENTRY_PRICE * 100}%`, crypto },
     'Executing strategy'
   );
 
@@ -120,7 +258,7 @@ export async function executeStrategy(
     };
   }
 
-  // Only trade in the final N seconds
+  // Only trade in the final N seconds (last 88 seconds)
   if (!isInTradingWindow(window, now)) {
     return {
       marketSlug: window.slug,
@@ -131,13 +269,13 @@ export async function executeStrategy(
 
   logger.info(
     { slug: window.slug, secondsLeft: getSecondsUntilClose(window, now) },
-    'Entering trading window'
+    'Entering trading window (last 88 seconds)'
   );
 
   // ============================================
-  // PHASE 1: Active Window - Poll for 99% threshold
+  // Poll for 90-98% price (skip if 99%)
   // ============================================
-  while (Math.floor(Date.now() / 1000) < fallbackStart) {
+  while (Math.floor(Date.now() / 1000) < window.endTime) {
     try {
       const snapshot = await fetchPrices(tradingClient, tokenIds);
       const { upPrice, downPrice } = snapshot;
@@ -148,34 +286,65 @@ export async function executeStrategy(
           slug: window.slug,
           up: `${(upPrice * 100).toFixed(2)}%`,
           down: `${(downPrice * 100).toFixed(2)}%`,
-          threshold: `${(config.MIN_PRICE_THRESHOLD * 100).toFixed(0)}%`,
+          range: `${MIN_ENTRY_PRICE * 100}%-${MAX_ENTRY_PRICE * 100}%`,
           timeLeft: `${timeLeft}s`,
         },
         'Price check'
       );
 
-      // Check if either side hits 99% threshold
+      // Check if either side is in valid range (90-98%, skip 99%)
       let targetSide: 'UP' | 'DOWN' | null = null;
       let targetTokenId: string | null = null;
       let targetPrice = 0;
 
-      if (upPrice >= config.MIN_PRICE_THRESHOLD) {
+      // Check UP side: >= 90% AND <= 98%
+      if (upPrice >= MIN_ENTRY_PRICE && upPrice <= MAX_ENTRY_PRICE) {
         targetSide = 'UP';
         targetTokenId = tokenIds.up;
         targetPrice = upPrice;
-      } else if (downPrice >= config.MIN_PRICE_THRESHOLD) {
+      }
+      // Check DOWN side: >= 90% AND <= 98%
+      else if (downPrice >= MIN_ENTRY_PRICE && downPrice <= MAX_ENTRY_PRICE) {
         targetSide = 'DOWN';
         targetTokenId = tokenIds.down;
         targetPrice = downPrice;
       }
+      // If 99% hit, skip entire window (no profit margin)
+      else if (upPrice >= 0.99 || downPrice >= 0.99) {
+        logger.info(
+          { up: `${(upPrice * 100).toFixed(2)}%`, down: `${(downPrice * 100).toFixed(2)}%`, slug: window.slug },
+          'Price at 99%, skipping window (no profit margin)'
+        );
+        tradeTracker.markSkipped(window.slug);
+        return {
+          marketSlug: window.slug,
+          traded: false,
+          skipReason: 'Price at 99%, no profit margin',
+        };
+      }
 
       if (targetSide && targetTokenId) {
+        // Check if another bot already bought for this window
+        const existingLock = await checkTradeLock(window.slug);
+        if (existingLock && existingLock !== crypto) {
+          logger.info(
+            { crypto, existingLock, slug: window.slug },
+            'Another bot already bought, skipping'
+          );
+          tradeTracker.markSkipped(window.slug);
+          return {
+            marketSlug: window.slug,
+            traded: false,
+            skipReason: `Already bought by ${existingLock}`,
+          };
+        }
+
         logger.info(
-          { side: targetSide, price: `${(targetPrice * 100).toFixed(2)}%`, slug: window.slug },
-          '99% threshold hit! Buying...'
+          { side: targetSide, price: `${(targetPrice * 100).toFixed(2)}%`, slug: window.slug, crypto },
+          'Price in range (90-98%)! Buying...'
         );
 
-        // Try to buy once, if no match move on (will retry in next loop or Phase 2)
+        // Try to buy
         const result = await tryBuy(
           tradingClient,
           targetTokenId,
@@ -187,6 +356,9 @@ export async function executeStrategy(
         );
 
         if (result.matched) {
+          // Mark trade lock so other bots skip this window
+          await markTradeLock(window.slug, crypto);
+
           const tradeResult: TradeResult = {
             success: true,
             orderId: result.orderId,
@@ -194,117 +366,46 @@ export async function executeStrategy(
             side: targetSide,
           };
           tradeTracker.markTraded(window.slug, tradeResult);
+
+          // Always place limit sell at fill price + 1 cent
+          if (result.fillPrice && result.tokensReceived && !config.DRY_RUN) {
+            logger.info(
+              { fillPrice: `${(result.fillPrice * 100).toFixed(0)}%`, tokens: result.tokensReceived, slug: window.slug },
+              'Placing limit sell at fill price + 1 cent'
+            );
+            await placeLimitSellOneCentHigher(
+              clobClient,
+              targetTokenId,
+              result.tokensReceived,
+              tokenIds.negRisk,
+              tokenIds.tickSize,
+              window.slug,
+              result.fillPrice
+            );
+          }
+
           return { marketSlug: window.slug, traded: true, tradeResult };
         }
-        // No match - continue to next price check or Phase 2
+        // No match - continue polling
         if (config.IS_SERVER) await sleep(500);
       } else {
-        // No threshold hit - add delay before next price check
+        // Price not in range - wait and check again
         if (config.IS_SERVER) await sleep(500);
       }
     } catch (error) {
-      logger.warn({ error, slug: window.slug }, 'Error in active window, continuing...');
+      logger.warn({ error, slug: window.slug }, 'Error in trading window, continuing...');
       if (config.IS_SERVER) await sleep(500);
     }
   }
 
-  // ============================================
-  // PHASE 2: Fallback Window - Buy higher side (loop continuously)
-  // ============================================
-  logger.info({ slug: window.slug }, 'Entering fallback window (last 5 seconds)');
-
-  while (Math.floor(Date.now() / 1000) < retryDeadline) {
-    try {
-      const snapshot = await fetchPrices(tradingClient, tokenIds);
-      const { upPrice, downPrice } = snapshot;
-
-      const higherSide: 'UP' | 'DOWN' = upPrice >= downPrice ? 'UP' : 'DOWN';
-      const higherTokenId = upPrice >= downPrice ? tokenIds.up : tokenIds.down;
-      const higherPrice = Math.max(upPrice, downPrice);
-
-      // Check if higher side is > 60%
-      if (higherPrice < 0.60) {
-        const currentTime = Math.floor(Date.now() / 1000);
-        const timeInfo = currentTime >= window.marketCloseTime
-          ? `+${currentTime - window.marketCloseTime}s after close`
-          : `${window.marketCloseTime - currentTime}s left`;
-
-        logger.info(
-          {
-            slug: window.slug,
-            higherSide,
-            higherPrice: `${(higherPrice * 100).toFixed(2)}%`,
-            time: timeInfo,
-          },
-          'Higher side below 55%, skipping'
-        );
-        continue;
-      }
-
-      const currentTime = Math.floor(Date.now() / 1000);
-      const isAfterClose = currentTime >= window.marketCloseTime;
-      const timeInfo = isAfterClose
-        ? `+${currentTime - window.marketCloseTime}s after close`
-        : `${window.marketCloseTime - currentTime}s left`;
-
-      logger.info(
-        {
-          slug: window.slug,
-          up: `${(upPrice * 100).toFixed(2)}%`,
-          down: `${(downPrice * 100).toFixed(2)}%`,
-          chosen: higherSide,
-          time: timeInfo,
-          phase: isAfterClose ? 'retry' : 'fallback',
-        },
-        'Buying higher side'
-      );
-
-      const result = await tryBuy(
-        tradingClient,
-        higherTokenId,
-        config.BET_AMOUNT_USDC,
-        tokenIds.negRisk,
-        tokenIds.tickSize,
-        higherSide,
-        window.slug
-      );
-
-      if (result.orderId) {
-        const tradeResult: TradeResult = {
-          success: true,
-          orderId: result.orderId,
-          marketSlug: window.slug,
-          side: higherSide,
-        };
-        tradeTracker.markTraded(window.slug, tradeResult);
-        logger.info(
-          { orderId: result.orderId, side: higherSide, slug: window.slug },
-          'Trade matched!'
-        );
-        return { marketSlug: window.slug, traded: true, tradeResult };
-      }
-      // Add delay before retry if IS_SERVER
-      if (config.IS_SERVER) await sleep(500);
-    } catch (error) {
-      logger.warn({ error, slug: window.slug }, 'Error in fallback/retry window, continuing...');
-      if (config.IS_SERVER) await sleep(500);
-    }
-  }
-
-  // Retry deadline reached without match
-  logger.error({ slug: window.slug }, 'Trade failed - retry deadline reached (5s after close)');
-  const failedResult: TradeResult = {
-    success: false,
-    error: 'No match within retry window',
-    marketSlug: window.slug,
-    side: 'UP',
-  };
-  tradeTracker.markTraded(window.slug, failedResult);
+  // Window ended without trade
+  logger.info({ slug: window.slug }, 'Trading window ended, no trade made');
+  tradeTracker.markSkipped(window.slug);
 
   return {
     marketSlug: window.slug,
     traded: false,
-    skipReason: 'No match within retry window',
+    skipReason: 'No valid price in window',
   };
 }
 
@@ -357,6 +458,7 @@ export async function processMarket(
     window,
     marketData.tokenIds,
     tradeTracker,
-    config
+    config,
+    eventConfig.crypto
   );
 }

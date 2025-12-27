@@ -50,5 +50,19 @@ module.exports = {
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
       time: true,
     },
+    {
+      name: 'pm-xrp-tiered-redeem',
+      script: 'dist/redeem.js',
+      env: {
+        DOTENV_CONFIG_PATH: '.env.xrp_higher',
+      },
+      node_args: '-r dotenv/config',
+      output: './logs/xrp-tiered-redeem-out.log',
+      error: './logs/xrp-tiered-redeem-error.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      time: true,
+      cron_restart: '*/5 * * * *', // Auto redeem every 5 minutes
+      autorestart: false,
+    },
   ],
 };
