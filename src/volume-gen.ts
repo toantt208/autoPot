@@ -13,8 +13,8 @@ import { getConfig } from './config/index.js';
 import { TradingClient } from './clients/trading-client.js';
 
 // CLI arguments
-const TOKEN_ID = "102504892414163237174864879683522880588750452841477290216845150938663289742135";
-const LOOPS = 10;
+const TOKEN_ID = "2213957649161627793381994368131485505647723208738124952452819345058597751695";
+const LOOPS = 20;
 const TRADE_AMOUNT = 10;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

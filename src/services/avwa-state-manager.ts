@@ -14,36 +14,40 @@ import type { AvwaPosition, AvwaTrade, Prisma } from '@prisma/client';
 const AVWA_STATE_PREFIX = 'avwa:state:';
 const AVWA_STATE_TTL = 1800; // 30 minutes
 
-// Phase types
-export type AvwaPhase = 'WAITING' | 'ENTRY' | 'DCA' | 'SNIPER_READY' | 'LOCKING' | 'LOCKED' | 'RESOLVED';
+// Phase types - V2: INITIAL buys both sides, DCA rebalances, RESERVE for final lock
+export type AvwaPhase = 'WAITING' | 'INITIAL' | 'DCA' | 'RESERVE' | 'LOCKED' | 'RESOLVED';
 export type AvwaStatus = 'ACTIVE' | 'COMPLETED' | 'EXPIRED';
 
-// State interface (in-memory representation)
+// State interface (in-memory representation) - V2: Track both sides equally
 export interface AvwaState {
   marketSlug: string;
   crypto: string;
   phase: AvwaPhase;
   status: AvwaStatus;
 
-  // Capital pools (remaining amounts)
+  // Capital pools (remaining amounts) - V2: 40/40/20 allocation
   initialPoolRemaining: number;
   dcaPoolRemaining: number;
-  sniperPoolRemaining: number;
+  reservePoolRemaining: number; // Renamed from sniperPoolRemaining
 
-  // Primary position
-  primarySide: 'UP' | 'DOWN';
+  // V2: Track BOTH sides equally (no primary/hedge distinction)
+  upTokens: number;
+  upSpent: number;
+  downTokens: number;
+  downSpent: number;
+
+  // Legacy fields for DB compatibility (mapped from up/down)
+  primarySide: 'UP' | 'DOWN'; // Set to side with more tokens
   primaryTokens: number;
   primarySpent: number;
   primaryAvgPrice: number;
-
-  // Hedge position
   hedgeTokens: number;
   hedgeSpent: number;
   hedgeAvgPrice: number;
 
-  // DCA tracking
-  dcaLevel: number; // 0-5
-  dcaTriggerPrices: number[]; // Price levels that trigger DCA
+  // DCA tracking - V2: tracks rebalance count instead of levels
+  dcaLevel: number; // Number of rebalance operations
+  dcaTriggerPrices: number[]; // Not used in V2, kept for compatibility
 
   // Arbitrage
   arbitrageLocked: boolean;
@@ -51,10 +55,10 @@ export interface AvwaState {
   expectedProfit: number;
 }
 
-// Trade record for logging
+// Trade record for logging - V2: RESERVE replaces SNIPER
 export interface AvwaTradeRecord {
   side: 'UP' | 'DOWN';
-  pool: 'INITIAL' | 'DCA' | 'SNIPER';
+  pool: 'INITIAL' | 'DCA' | 'RESERVE'; // V2: RESERVE instead of SNIPER
   amount: number;
   tokens: number;
   price: number;
@@ -65,29 +69,38 @@ export interface AvwaTradeRecord {
   dcaLevel?: number;
 }
 
-// AVWA configuration
+// AVWA configuration - V2: 40/40/20 allocation, rebalance-based DCA
 export interface AvwaConfig {
   crypto: string;
   totalCapital: number;
-  initialPoolPct: number; // 0.20 = 20%
-  dcaPoolPct: number; // 0.50 = 50%
-  sniperPoolPct: number; // 0.30 = 30%
-  dcaLevels: number; // 5 levels
-  dcaTriggerPct: number; // 0.04 = 4% drop
-  arbitrageThreshold: number; // 0.985 = 1.5% profit
+  initialPoolPct: number; // V2: 0.40 = 40% - buy BOTH sides
+  dcaPoolPct: number; // V2: 0.40 = 40% - rebalance imbalance
+  reservePoolPct: number; // V2: 0.20 = 20% - emergency/final lock (renamed from sniperPoolPct)
+
+  // V2: Entry conditions
+  minProfitPct: number; // 0.01 = 1% min profit to enter (totalPrice < 0.99)
+  maxTotalPrice: number; // 0.99 = max totalPrice to enter
+
+  // V2: DCA/Rebalance triggers
+  imbalanceThreshold: number; // 0.05 = 5% imbalance triggers rebalance
+  dcaAmount: number; // $200 per rebalance operation
+
+  // Reserve trigger
+  reserveWindowSeconds: number; // 120 = last 2 minutes
+
+  // Anti-slippage (unchanged)
   maxSlippagePct: number; // 0.005 = 0.5%
   icebergThreshold: number; // $100
   icebergChunkSize: number; // $50
-  sniperWindowSeconds: number; // 180 = 3 minutes
 }
 
 /**
- * Initialize a new AVWA state for a market window
+ * Initialize a new AVWA state for a market window - V2
  */
 export function initializeState(marketSlug: string, config: AvwaConfig): AvwaState {
   const initialPool = config.totalCapital * config.initialPoolPct;
   const dcaPool = config.totalCapital * config.dcaPoolPct;
-  const sniperPool = config.totalCapital * config.sniperPoolPct;
+  const reservePool = config.totalCapital * config.reservePoolPct;
 
   return {
     marketSlug,
@@ -95,22 +108,27 @@ export function initializeState(marketSlug: string, config: AvwaConfig): AvwaSta
     phase: 'WAITING',
     status: 'ACTIVE',
 
-    // Start with full pools
+    // V2: Start with full pools (40/40/20)
     initialPoolRemaining: initialPool,
     dcaPoolRemaining: dcaPool,
-    sniperPoolRemaining: sniperPool,
+    reservePoolRemaining: reservePool,
 
-    // No position yet
-    primarySide: 'UP', // Will be set at entry
+    // V2: Track both sides equally
+    upTokens: 0,
+    upSpent: 0,
+    downTokens: 0,
+    downSpent: 0,
+
+    // Legacy fields for DB compatibility
+    primarySide: 'UP',
     primaryTokens: 0,
     primarySpent: 0,
     primaryAvgPrice: 0,
-
     hedgeTokens: 0,
     hedgeSpent: 0,
     hedgeAvgPrice: 0,
 
-    // DCA tracking
+    // DCA tracking (rebalance count in V2)
     dcaLevel: 0,
     dcaTriggerPrices: [],
 
@@ -119,6 +137,36 @@ export function initializeState(marketSlug: string, config: AvwaConfig): AvwaSta
     guaranteedTokens: 0,
     expectedProfit: 0,
   };
+}
+
+/**
+ * Sync legacy fields from V2 up/down tracking (for DB compatibility)
+ */
+export function syncLegacyFields(state: AvwaState): void {
+  // Primary side is the one with more tokens
+  if (state.upTokens >= state.downTokens) {
+    state.primarySide = 'UP';
+    state.primaryTokens = state.upTokens;
+    state.primarySpent = state.upSpent;
+    state.primaryAvgPrice = state.upTokens > 0 ? state.upSpent / state.upTokens : 0;
+    state.hedgeTokens = state.downTokens;
+    state.hedgeSpent = state.downSpent;
+    state.hedgeAvgPrice = state.downTokens > 0 ? state.downSpent / state.downTokens : 0;
+  } else {
+    state.primarySide = 'DOWN';
+    state.primaryTokens = state.downTokens;
+    state.primarySpent = state.downSpent;
+    state.primaryAvgPrice = state.downTokens > 0 ? state.downSpent / state.downTokens : 0;
+    state.hedgeTokens = state.upTokens;
+    state.hedgeSpent = state.upSpent;
+    state.hedgeAvgPrice = state.upTokens > 0 ? state.upSpent / state.upTokens : 0;
+  }
+
+  // Calculate guaranteed tokens and profit
+  state.guaranteedTokens = Math.min(state.upTokens, state.downTokens);
+  const totalSpent = state.upSpent + state.downSpent;
+  state.expectedProfit = state.guaranteedTokens - totalSpent;
+  state.arbitrageLocked = state.expectedProfit > 0;
 }
 
 /**
@@ -327,24 +375,42 @@ export async function clearRedisState(marketSlug: string): Promise<void> {
 // ============================================
 
 function dbToState(db: AvwaPosition): AvwaState {
+  const primarySide = db.primarySide as 'UP' | 'DOWN';
+  const primaryTokens = Number(db.primaryTokens);
+  const primarySpent = Number(db.primarySpent);
+  const hedgeTokens = Number(db.hedgeTokens);
+  const hedgeSpent = Number(db.hedgeSpent);
+
+  // V2: Reconstruct up/down from primary/hedge
+  const upTokens = primarySide === 'UP' ? primaryTokens : hedgeTokens;
+  const upSpent = primarySide === 'UP' ? primarySpent : hedgeSpent;
+  const downTokens = primarySide === 'DOWN' ? primaryTokens : hedgeTokens;
+  const downSpent = primarySide === 'DOWN' ? primarySpent : hedgeSpent;
+
   return {
     marketSlug: db.marketSlug,
     crypto: db.crypto,
     phase: db.phase as AvwaPhase,
     status: db.status as AvwaStatus,
 
-    // Calculate remaining from used
-    initialPoolRemaining: 0, // Will be recalculated from config
+    // Calculate remaining from used (will be recalculated from config)
+    initialPoolRemaining: 0,
     dcaPoolRemaining: 0,
-    sniperPoolRemaining: 0,
+    reservePoolRemaining: 0,
 
-    primarySide: db.primarySide as 'UP' | 'DOWN',
-    primaryTokens: Number(db.primaryTokens),
-    primarySpent: Number(db.primarySpent),
+    // V2: Track both sides
+    upTokens,
+    upSpent,
+    downTokens,
+    downSpent,
+
+    // Legacy fields
+    primarySide,
+    primaryTokens,
+    primarySpent,
     primaryAvgPrice: db.primaryAvgPrice ? Number(db.primaryAvgPrice) : 0,
-
-    hedgeTokens: Number(db.hedgeTokens),
-    hedgeSpent: Number(db.hedgeSpent),
+    hedgeTokens,
+    hedgeSpent,
     hedgeAvgPrice: db.hedgeAvgPrice ? Number(db.hedgeAvgPrice) : 0,
 
     dcaLevel: db.dcaLevel,
@@ -357,17 +423,21 @@ function dbToState(db: AvwaPosition): AvwaState {
 }
 
 function stateToDb(state: AvwaState): Omit<Prisma.AvwaPositionCreateInput, 'trades'> {
+  // V2: Sync legacy fields before saving
+  syncLegacyFields(state);
+
   return {
     marketSlug: state.marketSlug,
     crypto: state.crypto,
     phase: state.phase,
     status: state.status,
 
-    // Store used amounts (total - remaining)
-    initialPoolUsed: 0, // Will be calculated on read
+    // Store used amounts
+    initialPoolUsed: 0,
     dcaPoolUsed: 0,
     sniperPoolUsed: 0,
 
+    // Legacy fields (synced from up/down)
     primarySide: state.primarySide,
     primaryTokens: state.primaryTokens,
     primarySpent: state.primarySpent,
@@ -388,14 +458,18 @@ function stateToDb(state: AvwaState): Omit<Prisma.AvwaPositionCreateInput, 'trad
 }
 
 /**
- * Get metrics for current state
+ * Get metrics for current state - V2: Uses up/down tracking
  */
 export function getStateMetrics(state: AvwaState) {
-  const totalSpent = state.primarySpent + state.hedgeSpent;
-  const guaranteed = Math.min(state.primaryTokens, state.hedgeTokens);
+  const totalSpent = state.upSpent + state.downSpent;
+  const guaranteed = Math.min(state.upTokens, state.downTokens);
   const profit = guaranteed - totalSpent;
   const profitPct = totalSpent > 0 ? (profit / totalSpent) * 100 : 0;
-  const imbalance = state.primaryTokens - state.hedgeTokens;
+  const imbalance = state.upTokens - state.downTokens;
+  const imbalancePct =
+    Math.max(state.upTokens, state.downTokens) > 0
+      ? Math.abs(imbalance) / Math.max(state.upTokens, state.downTokens)
+      : 0;
 
   return {
     totalSpent,
@@ -403,7 +477,36 @@ export function getStateMetrics(state: AvwaState) {
     profit,
     profitPct,
     imbalance,
-    isBalanced: Math.abs(imbalance) < 0.1,
-    canLockArbitrage: state.primaryTokens > 0 && state.hedgeTokens > 0,
+    imbalancePct,
+    isBalanced: imbalancePct < 0.05,
+    canLockArbitrage: state.upTokens > 0 && state.downTokens > 0,
+    upTokens: state.upTokens,
+    downTokens: state.downTokens,
+    upSpent: state.upSpent,
+    downSpent: state.downSpent,
   };
+}
+
+/**
+ * Check if rebalance is needed - V2
+ */
+export function shouldRebalance(state: AvwaState, threshold: number = 0.05): { needed: boolean; side: 'UP' | 'DOWN'; tokensNeeded: number } {
+  const imbalance = state.upTokens - state.downTokens;
+  const maxTokens = Math.max(state.upTokens, state.downTokens);
+
+  if (maxTokens === 0) {
+    return { needed: false, side: 'UP', tokensNeeded: 0 };
+  }
+
+  const imbalancePct = Math.abs(imbalance) / maxTokens;
+
+  if (imbalancePct < threshold) {
+    return { needed: false, side: 'UP', tokensNeeded: 0 };
+  }
+
+  // Buy the side with fewer tokens
+  const side: 'UP' | 'DOWN' = imbalance > 0 ? 'DOWN' : 'UP';
+  const tokensNeeded = Math.abs(imbalance);
+
+  return { needed: true, side, tokensNeeded };
 }

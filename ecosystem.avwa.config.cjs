@@ -1,19 +1,17 @@
 /**
- * PM2 Ecosystem Config - AVWA (Adaptive Volume-Weighted Arbitrage)
+ * PM2 Ecosystem Config - AVWA V2 (Adaptive Volume-Weighted Arbitrage)
  *
- * Institutional-grade algorithm for $5,000+ capital on Polymarket BTC up/down markets.
+ * Dual-side entry strategy for safer arbitrage on Polymarket BTC up/down markets.
  *
- * Capital Allocation:
- *   Tier 1 (Initial): 20% = $1,000 - Base position on higher probability side
- *   Tier 2 (DCA Pool): 50% = $2,500 - 5 levels x $500, triggered at 4% drops
- *   Tier 3 (Sniper): 30% = $1,500 - Lock arbitrage when avgPrice + hedgePrice < 0.985
+ * V2 Key Changes:
+ *   - INITIAL: Buy BOTH sides weighted by price (equal tokens from start)
+ *   - DCA: Rebalance imbalance (buy weaker side) instead of one-sided DCA
+ *   - RESERVE: Emergency/final lock (renamed from SNIPER)
  *
- * Key Features:
- *   - Anti-slippage: Iceberg orders for amounts > $100
- *   - Orderbook depth checking before trades
- *   - DCA with recalculated trigger prices
- *   - 1.5% guaranteed profit target
- *   - Dual persistence (Redis + PostgreSQL)
+ * Capital Allocation (40/40/20):
+ *   Tier 1 (Initial): 40% = $2,000 - Buy BOTH sides weighted by price
+ *   Tier 2 (DCA Pool): 40% = $2,000 - Rebalance imbalance
+ *   Tier 3 (Reserve): 20% = $1,000 - Emergency/final lock
  *
  * Commands:
  *   Start:  pm2 start ecosystem.avwa.config.cjs
@@ -31,23 +29,22 @@ module.exports = {
       env: {
         DOTENV_CONFIG_PATH: '.env',
 
-        // Capital allocation
+        // V2: Capital allocation (40/40/20)
         TOTAL_CAPITAL: '5000',
-        INITIAL_POOL_PCT: '0.20', // 20% = $1,000
-        DCA_POOL_PCT: '0.50', // 50% = $2,500
-        SNIPER_POOL_PCT: '0.30', // 30% = $1,500
+        INITIAL_POOL_PCT: '0.40', // 40% = $2,000 - buy BOTH sides
+        DCA_POOL_PCT: '0.40', // 40% = $2,000 - rebalance imbalance
+        RESERVE_POOL_PCT: '0.20', // 20% = $1,000 - emergency/final lock
 
-        // DCA config
-        DCA_LEVELS: '5', // 5 DCA levels
-        DCA_TRIGGER_PCT: '0.04', // 4% drop triggers DCA
+        // V2: Entry conditions - based on individual prices
+        ENTRY_MIN: '0.05', // 5% min probability to enter
+        ENTRY_MAX: '0.80', // 80% max probability to enter
 
-        // Entry config
-        ENTRY_MIN: '0.05', // Min 5% to enter
-        ENTRY_MAX: '0.80', // Max 80% to enter
+        // V2: DCA/Rebalance triggers
+        IMBALANCE_THRESHOLD: '0.05', // 5% imbalance triggers rebalance
+        DCA_AMOUNT: '200', // $200 per rebalance operation
 
-        // Arbitrage config
-        ARBITRAGE_THRESHOLD: '0.985', // Lock at 1.5%+ profit
-        SNIPER_WINDOW_SECONDS: '180', // Last 3 minutes
+        // Reserve trigger
+        RESERVE_WINDOW_SECONDS: '120', // Last 2 minutes
 
         // Anti-slippage
         MAX_SLIPPAGE_PCT: '0.005', // 0.5% max slippage

@@ -1,22 +1,20 @@
 /**
- * AVWA (Adaptive Volume-Weighted Arbitrage) Strategy
+ * AVWA V2 (Adaptive Volume-Weighted Arbitrage) Strategy
  *
- * Institutional-grade algorithm for $5,000+ capital on Polymarket BTC up/down markets.
+ * Dual-side entry strategy for safer arbitrage on Polymarket BTC up/down markets.
  *
- * Capital Allocation:
- *   Tier 1 (Initial): 20% = $1,000 - Base position on higher probability side
- *   Tier 2 (DCA Pool): 50% = $2,500 - 5 levels x $500, triggered at 4% drops
- *   Tier 3 (Sniper): 30% = $1,500 - Lock arbitrage when avgPrice + hedgePrice < 0.985
+ * V2 Key Changes from V1:
+ *   - INITIAL: Buy BOTH sides weighted by price (equal tokens from start)
+ *   - DCA: Rebalance imbalance (buy weaker side) instead of one-sided DCA
+ *   - RESERVE: Emergency/final lock in last 2 minutes (renamed from SNIPER)
  *
- * Key Features:
- *   - Anti-slippage: Iceberg orders for amounts > $100
- *   - Orderbook depth checking before trades
- *   - DCA with recalculated trigger prices
- *   - 1.5% guaranteed profit target
- *   - Dual persistence (Redis + PostgreSQL)
+ * Capital Allocation (40/40/20):
+ *   Tier 1 (Initial): 40% = $2,000 - Buy BOTH sides weighted by price
+ *   Tier 2 (DCA Pool): 40% = $2,000 - Rebalance imbalance
+ *   Tier 3 (Reserve): 20% = $1,000 - Emergency/final lock
  *
  * Usage:
- *   DOTENV_CONFIG_PATH=.env.avwa node dist/avwa.js
+ *   DOTENV_CONFIG_PATH=.env.avwa node dist/avwa.js btc
  */
 
 import { getConfig } from './config/index.js';
@@ -33,39 +31,50 @@ import {
   recordTrade,
   updateSession,
   resolvePosition,
-  calculateDcaTriggers,
+  syncLegacyFields,
   getStateMetrics,
+  shouldRebalance,
   type AvwaState,
   type AvwaConfig,
   type AvwaTradeRecord,
 } from './services/avwa-state-manager.js';
 import type { TokenIds } from './types/index.js';
 
-// Parse config from environment
+// Parse config from environment - V2: 40/40/20 allocation
 const config: AvwaConfig = {
   crypto: process.argv[2]?.toLowerCase() || 'btc',
   totalCapital: parseFloat(process.env.TOTAL_CAPITAL || '5000'),
-  initialPoolPct: parseFloat(process.env.INITIAL_POOL_PCT || '0.20'),
-  dcaPoolPct: parseFloat(process.env.DCA_POOL_PCT || '0.50'),
-  sniperPoolPct: parseFloat(process.env.SNIPER_POOL_PCT || '0.30'),
-  dcaLevels: parseInt(process.env.DCA_LEVELS || '5'),
-  dcaTriggerPct: parseFloat(process.env.DCA_TRIGGER_PCT || '0.04'),
-  arbitrageThreshold: parseFloat(process.env.ARBITRAGE_THRESHOLD || '0.985'),
+  initialPoolPct: parseFloat(process.env.INITIAL_POOL_PCT || '0.40'), // V2: 40%
+  dcaPoolPct: parseFloat(process.env.DCA_POOL_PCT || '0.40'), // V2: 40%
+  reservePoolPct: parseFloat(process.env.RESERVE_POOL_PCT || '0.20'), // V2: 20%
+
+  // V2: Entry conditions - based on individual prices
+  minProfitPct: parseFloat(process.env.MIN_PROFIT_PCT || '0.01'), // (unused in V2)
+  maxTotalPrice: parseFloat(process.env.MAX_TOTAL_PRICE || '0.99'), // (unused in V2)
+
+  // V2: DCA/Rebalance triggers
+  imbalanceThreshold: parseFloat(process.env.IMBALANCE_THRESHOLD || '0.05'), // 5%
+  dcaAmount: parseFloat(process.env.DCA_AMOUNT || '200'), // $200 per rebalance
+
+  // Reserve trigger
+  reserveWindowSeconds: parseInt(process.env.RESERVE_WINDOW_SECONDS || '120'), // 2 min
+
+  // Anti-slippage
   maxSlippagePct: parseFloat(process.env.MAX_SLIPPAGE_PCT || '0.005'),
   icebergThreshold: parseFloat(process.env.ICEBERG_THRESHOLD || '100'),
   icebergChunkSize: parseFloat(process.env.ICEBERG_CHUNK_SIZE || '50'),
-  sniperWindowSeconds: parseInt(process.env.SNIPER_WINDOW_SECONDS || '180'),
 };
 
+// Entry conditions (separate from config interface for backward compatibility)
 const ENTRY_MIN = parseFloat(process.env.ENTRY_MIN || '0.05');
 const ENTRY_MAX = parseFloat(process.env.ENTRY_MAX || '0.80');
+
 const DRY_RUN = process.env.DRY_RUN !== 'false';
 
 // Calculated pool amounts
 const INITIAL_POOL = config.totalCapital * config.initialPoolPct;
 const DCA_POOL = config.totalCapital * config.dcaPoolPct;
-const SNIPER_POOL = config.totalCapital * config.sniperPoolPct;
-const DCA_PER_LEVEL = DCA_POOL / config.dcaLevels;
+const RESERVE_POOL = config.totalCapital * config.reservePoolPct;
 
 /**
  * Get time left in current 15-minute window
@@ -88,7 +97,7 @@ function getCurrentWindowSlug(): string {
 }
 
 /**
- * Execute a buy (dry run or live)
+ * Execute a buy (dry run or live) - V2
  */
 async function executeBuy(
   tradingClient: TradingClient,
@@ -96,7 +105,7 @@ async function executeBuy(
   state: AvwaState,
   side: 'UP' | 'DOWN',
   amount: number,
-  pool: 'INITIAL' | 'DCA' | 'SNIPER',
+  pool: 'INITIAL' | 'DCA' | 'RESERVE',
   currentPrice: number
 ): Promise<{ success: boolean; tokens: number; spent: number }> {
   if (DRY_RUN) {
@@ -175,6 +184,7 @@ async function executeBuy(
 
 /**
  * Handle WAITING phase - wait for suitable entry conditions
+ * V2: Entry when higher price is in range (5%-80%)
  */
 async function handleWaitingPhase(
   state: AvwaState,
@@ -183,13 +193,16 @@ async function handleWaitingPhase(
 ): Promise<AvwaState> {
   const higherPrice = Math.max(upPrice, downPrice);
 
-  // Check if price is in entry range
+  // V2: Entry when higher price is in range
   if (higherPrice >= ENTRY_MIN && higherPrice <= ENTRY_MAX) {
-    state.phase = 'ENTRY';
-    state.primarySide = upPrice > downPrice ? 'UP' : 'DOWN';
+    state.phase = 'INITIAL';
     logger.info(
-      { higherPrice: (higherPrice * 100).toFixed(1) + '%', side: state.primarySide },
-      'Entry conditions met, transitioning to ENTRY phase'
+      {
+        higherPrice: (higherPrice * 100).toFixed(2) + '%',
+        up: (upPrice * 100).toFixed(1) + '%',
+        down: (downPrice * 100).toFixed(1) + '%',
+      },
+      'Entry conditions met, transitioning to INITIAL phase'
     );
   }
 
@@ -197,63 +210,86 @@ async function handleWaitingPhase(
 }
 
 /**
- * Handle ENTRY phase - execute initial $1,000 buy
+ * Handle INITIAL phase - V2: Buy BOTH sides weighted by price
+ * This creates equal tokens on both sides for guaranteed arbitrage from start
  */
-async function handleEntryPhase(
+async function handleInitialPhase(
   state: AvwaState,
   tradingClient: TradingClient,
   tokenIds: TokenIds,
   upPrice: number,
   downPrice: number
 ): Promise<AvwaState> {
-  const currentPrice = state.primarySide === 'UP' ? upPrice : downPrice;
+  const higherPrice = Math.max(upPrice, downPrice);
 
   // Verify still in entry range
-  if (currentPrice < ENTRY_MIN || currentPrice > ENTRY_MAX) {
-    logger.info({ currentPrice: (currentPrice * 100).toFixed(1) + '%' }, 'Price out of range, waiting...');
+  if (higherPrice < ENTRY_MIN || higherPrice > ENTRY_MAX) {
+    logger.info({ higherPrice: (higherPrice * 100).toFixed(2) + '%' }, 'Price out of range, waiting...');
     state.phase = 'WAITING';
     return state;
   }
 
-  // Execute initial buy
-  const result = await executeBuy(
-    tradingClient,
-    tokenIds,
-    state,
-    state.primarySide,
-    INITIAL_POOL,
-    'INITIAL',
-    currentPrice
+  const totalPrice = upPrice + downPrice;
+
+  // V2: Calculate weighted buys for equal tokens
+  // tokensPerDollar = INITIAL_POOL / totalPrice
+  // upSpend = tokens * upPrice, downSpend = tokens * downPrice
+  const tokensTarget = INITIAL_POOL / totalPrice;
+  const upSpendAmount = tokensTarget * upPrice;
+  const downSpendAmount = tokensTarget * downPrice;
+
+  logger.info(
+    {
+      totalPrice: (totalPrice * 100).toFixed(2) + '%',
+      tokensTarget: tokensTarget.toFixed(4),
+      upSpend: '$' + upSpendAmount.toFixed(2),
+      downSpend: '$' + downSpendAmount.toFixed(2),
+      profitPct: ((1 - totalPrice) * 100).toFixed(2) + '%',
+    },
+    'V2: Buying BOTH sides weighted by price'
   );
 
-  if (result.success) {
-    state.primaryTokens += result.tokens;
-    state.primarySpent += result.spent;
-    state.initialPoolRemaining = 0;
+  // Buy UP side
+  const upResult = await executeBuy(tradingClient, tokenIds, state, 'UP', upSpendAmount, 'INITIAL', upPrice);
 
-    // Calculate average cost and DCA triggers
-    state.primaryAvgPrice = state.primarySpent / state.primaryTokens;
-    state.dcaTriggerPrices = calculateDcaTriggers(state.primaryAvgPrice, config.dcaTriggerPct, config.dcaLevels);
-
-    state.phase = 'DCA';
-
-    logger.info(
-      {
-        side: state.primarySide,
-        tokens: state.primaryTokens.toFixed(4),
-        spent: '$' + state.primarySpent.toFixed(2),
-        avgPrice: (state.primaryAvgPrice * 100).toFixed(2) + '%',
-        dcaTriggers: state.dcaTriggerPrices.map((p) => (p * 100).toFixed(2) + '%'),
-      },
-      'Entry complete, transitioning to DCA phase'
-    );
+  if (upResult.success) {
+    state.upTokens += upResult.tokens;
+    state.upSpent += upResult.spent;
   }
+
+  // Buy DOWN side
+  const downResult = await executeBuy(tradingClient, tokenIds, state, 'DOWN', downSpendAmount, 'INITIAL', downPrice);
+
+  if (downResult.success) {
+    state.downTokens += downResult.tokens;
+    state.downSpent += downResult.spent;
+  }
+
+  // Update state
+  state.initialPoolRemaining = 0;
+  syncLegacyFields(state);
+
+  state.phase = 'DCA';
+
+  const metrics = getStateMetrics(state);
+  logger.info(
+    {
+      upTokens: state.upTokens.toFixed(4),
+      downTokens: state.downTokens.toFixed(4),
+      totalSpent: '$' + metrics.totalSpent.toFixed(2),
+      guaranteed: '$' + metrics.guaranteed.toFixed(2),
+      profit: '$' + metrics.profit.toFixed(2),
+      profitPct: metrics.profitPct.toFixed(2) + '%',
+      imbalancePct: (metrics.imbalancePct * 100).toFixed(2) + '%',
+    },
+    'V2: Initial entry complete, transitioning to DCA phase'
+  );
 
   return state;
 }
 
 /**
- * Handle DCA phase - monitor for 4% drops and execute DCA buys
+ * Handle DCA phase - V2: Rebalance imbalance by buying the weaker side
  */
 async function handleDcaPhase(
   state: AvwaState,
@@ -263,99 +299,74 @@ async function handleDcaPhase(
   downPrice: number,
   timeLeft: number
 ): Promise<AvwaState> {
-  const currentPrice = state.primarySide === 'UP' ? upPrice : downPrice;
-  const hedgePrice = state.primarySide === 'UP' ? downPrice : upPrice;
+  // Check for rebalance need
+  const rebalanceCheck = shouldRebalance(state, config.imbalanceThreshold);
 
-  // Check for arbitrage opportunity
-  const avgTotal = state.primaryAvgPrice + hedgePrice;
-  if (avgTotal < config.arbitrageThreshold) {
-    const profitPct = ((1 - avgTotal) / avgTotal) * 100;
-    logger.info(
-      {
-        avgCost: (state.primaryAvgPrice * 100).toFixed(2) + '%',
-        hedgePrice: (hedgePrice * 100).toFixed(2) + '%',
-        avgTotal: (avgTotal * 100).toFixed(2) + '%',
-        profitPct: profitPct.toFixed(2) + '%',
-      },
-      'ARBITRAGE OPPORTUNITY DETECTED!'
-    );
-    state.phase = 'SNIPER_READY';
-    return state;
-  }
+  if (rebalanceCheck.needed && state.dcaPoolRemaining > 0) {
+    const weakerSide = rebalanceCheck.side;
+    const weakerPrice = weakerSide === 'UP' ? upPrice : downPrice;
 
-  // Check for DCA trigger
-  const nextDcaLevel = state.dcaLevel + 1;
-  if (nextDcaLevel > config.dcaLevels || state.dcaPoolRemaining <= 0) {
-    // All DCA levels exhausted, transition to sniper ready when time is right
-    if (timeLeft <= config.sniperWindowSeconds) {
-      state.phase = 'SNIPER_READY';
-      logger.info({ timeLeft: timeLeft + 's' }, 'DCA exhausted, transitioning to SNIPER_READY');
-    }
-    return state;
-  }
+    // Calculate rebalance amount
+    const tokensNeeded = rebalanceCheck.tokensNeeded;
+    const costToBalance = tokensNeeded * weakerPrice;
+    const dcaAmount = Math.min(config.dcaAmount, costToBalance, state.dcaPoolRemaining);
 
-  const triggerPrice = state.dcaTriggerPrices[nextDcaLevel - 1];
-
-  if (currentPrice <= triggerPrice) {
-    // DCA triggered!
-    const dcaAmount = Math.min(DCA_PER_LEVEL, state.dcaPoolRemaining);
-
-    logger.info(
-      {
-        dcaLevel: nextDcaLevel,
-        triggerPrice: (triggerPrice * 100).toFixed(2) + '%',
-        currentPrice: (currentPrice * 100).toFixed(2) + '%',
-        dcaAmount: '$' + dcaAmount.toFixed(2),
-      },
-      'DCA trigger hit!'
-    );
-
-    const result = await executeBuy(
-      tradingClient,
-      tokenIds,
-      state,
-      state.primarySide,
-      dcaAmount,
-      'DCA',
-      currentPrice
-    );
-
-    if (result.success) {
-      state.primaryTokens += result.tokens;
-      state.primarySpent += result.spent;
-      state.dcaPoolRemaining -= result.spent;
-      state.dcaLevel = nextDcaLevel;
-
-      // Recalculate average cost and trigger prices
-      state.primaryAvgPrice = state.primarySpent / state.primaryTokens;
-      state.dcaTriggerPrices = calculateDcaTriggers(state.primaryAvgPrice, config.dcaTriggerPct, config.dcaLevels);
-
+    if (dcaAmount >= 1) {
       logger.info(
         {
-          dcaLevel: state.dcaLevel,
-          newAvgPrice: (state.primaryAvgPrice * 100).toFixed(2) + '%',
-          totalTokens: state.primaryTokens.toFixed(4),
-          totalSpent: '$' + state.primarySpent.toFixed(2),
+          weakerSide,
+          imbalance: rebalanceCheck.tokensNeeded.toFixed(4),
+          costToBalance: '$' + costToBalance.toFixed(2),
+          dcaAmount: '$' + dcaAmount.toFixed(2),
           dcaRemaining: '$' + state.dcaPoolRemaining.toFixed(2),
         },
-        'DCA executed, recalculated triggers'
+        'V2: Rebalancing imbalance'
       );
+
+      const result = await executeBuy(tradingClient, tokenIds, state, weakerSide, dcaAmount, 'DCA', weakerPrice);
+
+      if (result.success) {
+        if (weakerSide === 'UP') {
+          state.upTokens += result.tokens;
+          state.upSpent += result.spent;
+        } else {
+          state.downTokens += result.tokens;
+          state.downSpent += result.spent;
+        }
+
+        state.dcaPoolRemaining -= result.spent;
+        state.dcaLevel += 1;
+        syncLegacyFields(state);
+
+        const metrics = getStateMetrics(state);
+        logger.info(
+          {
+            dcaLevel: state.dcaLevel,
+            upTokens: state.upTokens.toFixed(4),
+            downTokens: state.downTokens.toFixed(4),
+            imbalancePct: (metrics.imbalancePct * 100).toFixed(2) + '%',
+            profit: '$' + metrics.profit.toFixed(2),
+          },
+          'V2: Rebalance executed'
+        );
+      }
     }
   }
 
-  // Transition to sniper if time is running out
-  if (timeLeft <= config.sniperWindowSeconds) {
-    state.phase = 'SNIPER_READY';
-    logger.info({ timeLeft: timeLeft + 's' }, 'Transitioning to SNIPER_READY phase');
+  // Transition to RESERVE if time is running out
+  if (timeLeft <= config.reserveWindowSeconds) {
+    state.phase = 'RESERVE';
+    logger.info({ timeLeft: timeLeft + 's' }, 'Transitioning to RESERVE phase');
   }
 
   return state;
 }
 
 /**
- * Handle SNIPER_READY phase - watch for arbitrage opportunity in final minutes
+ * Handle RESERVE phase - V2: Final lock in last 2 minutes
+ * Ensures position is perfectly balanced before window closes
  */
-async function handleSniperPhase(
+async function handleReservePhase(
   state: AvwaState,
   tradingClient: TradingClient,
   tokenIds: TokenIds,
@@ -363,99 +374,67 @@ async function handleSniperPhase(
   downPrice: number,
   timeLeft: number
 ): Promise<AvwaState> {
-  const hedgePrice = state.primarySide === 'UP' ? downPrice : upPrice;
+  const metrics = getStateMetrics(state);
 
-  // Check for arbitrage opportunity
-  const avgTotal = state.primaryAvgPrice + hedgePrice;
+  // Check if we need to use reserve to improve position
+  if (state.reservePoolRemaining > 0 && !metrics.isBalanced) {
+    const imbalance = state.upTokens - state.downTokens;
+    const weakerSide: 'UP' | 'DOWN' = imbalance > 0 ? 'DOWN' : 'UP';
+    const weakerPrice = weakerSide === 'UP' ? upPrice : downPrice;
 
-  if (avgTotal < config.arbitrageThreshold) {
-    const profitPct = ((1 - avgTotal) / avgTotal) * 100;
+    const tokensNeeded = Math.abs(imbalance);
+    const costToBalance = tokensNeeded * weakerPrice;
+    const reserveAmount = Math.min(costToBalance, state.reservePoolRemaining);
 
-    logger.info(
-      {
-        avgCost: (state.primaryAvgPrice * 100).toFixed(2) + '%',
-        hedgePrice: (hedgePrice * 100).toFixed(2) + '%',
-        avgTotal: (avgTotal * 100).toFixed(2) + '%',
-        profitPct: profitPct.toFixed(2) + '%',
-        timeLeft: timeLeft + 's',
-      },
-      'LOCKING ARBITRAGE!'
-    );
+    if (reserveAmount >= 1) {
+      logger.info(
+        {
+          weakerSide,
+          tokensNeeded: tokensNeeded.toFixed(4),
+          costToBalance: '$' + costToBalance.toFixed(2),
+          reserveAmount: '$' + reserveAmount.toFixed(2),
+          timeLeft: timeLeft + 's',
+        },
+        'V2: Using RESERVE to balance position'
+      );
 
-    state.phase = 'LOCKING';
-  } else if (timeLeft <= 60) {
-    // Emergency lock if we have position and time is critical
-    if (state.primaryTokens > 0 && state.sniperPoolRemaining > 0) {
-      logger.warn({ timeLeft: timeLeft + 's', avgTotal: (avgTotal * 100).toFixed(2) + '%' }, 'EMERGENCY: Time critical, attempting lock');
-      state.phase = 'LOCKING';
+      const result = await executeBuy(tradingClient, tokenIds, state, weakerSide, reserveAmount, 'RESERVE', weakerPrice);
+
+      if (result.success) {
+        if (weakerSide === 'UP') {
+          state.upTokens += result.tokens;
+          state.upSpent += result.spent;
+        } else {
+          state.downTokens += result.tokens;
+          state.downSpent += result.spent;
+        }
+
+        state.reservePoolRemaining -= result.spent;
+        syncLegacyFields(state);
+      }
     }
   }
 
-  return state;
-}
+  // Lock position if time is critical (< 30s) or position is good
+  if (timeLeft <= 30 || metrics.isBalanced) {
+    const finalMetrics = getStateMetrics(state);
 
-/**
- * Handle LOCKING phase - execute sniper pool to lock arbitrage
- */
-async function handleLockingPhase(
-  state: AvwaState,
-  tradingClient: TradingClient,
-  tokenIds: TokenIds,
-  upPrice: number,
-  downPrice: number
-): Promise<AvwaState> {
-  const hedgeSide = state.primarySide === 'UP' ? 'DOWN' : 'UP';
-  const hedgePrice = hedgeSide === 'UP' ? upPrice : downPrice;
-
-  // Calculate tokens needed to balance
-  const tokensNeeded = state.primaryTokens - state.hedgeTokens;
-  const costToBalance = tokensNeeded * hedgePrice;
-
-  // Use sniper pool (capped at available funds)
-  const sniperAmount = Math.min(costToBalance, state.sniperPoolRemaining);
-
-  if (sniperAmount < 1) {
-    logger.warn({ sniperRemaining: '$' + state.sniperPoolRemaining.toFixed(2) }, 'Insufficient sniper funds');
-    state.phase = 'LOCKED';
-    return state;
-  }
-
-  logger.info(
-    {
-      hedgeSide,
-      tokensNeeded: tokensNeeded.toFixed(4),
-      costToBalance: '$' + costToBalance.toFixed(2),
-      sniperAmount: '$' + sniperAmount.toFixed(2),
-      sniperRemaining: '$' + state.sniperPoolRemaining.toFixed(2),
-    },
-    'Executing sniper buy to lock arbitrage'
-  );
-
-  const result = await executeBuy(tradingClient, tokenIds, state, hedgeSide, sniperAmount, 'SNIPER', hedgePrice);
-
-  if (result.success) {
-    state.hedgeTokens += result.tokens;
-    state.hedgeSpent += result.spent;
-    state.sniperPoolRemaining -= result.spent;
-    state.hedgeAvgPrice = state.hedgeSpent / state.hedgeTokens;
-
-    // Calculate guaranteed tokens and profit
-    state.guaranteedTokens = Math.min(state.primaryTokens, state.hedgeTokens);
-    const totalSpent = state.primarySpent + state.hedgeSpent;
-    state.expectedProfit = state.guaranteedTokens - totalSpent;
-    state.arbitrageLocked = state.expectedProfit > 0;
-
+    state.guaranteedTokens = finalMetrics.guaranteed;
+    state.expectedProfit = finalMetrics.profit;
+    state.arbitrageLocked = finalMetrics.profit > 0;
     state.phase = 'LOCKED';
 
     logger.info(
       {
-        guaranteedTokens: state.guaranteedTokens.toFixed(4),
-        totalSpent: '$' + totalSpent.toFixed(2),
-        profit: '$' + state.expectedProfit.toFixed(2),
-        profitPct: ((state.expectedProfit / totalSpent) * 100).toFixed(2) + '%',
+        upTokens: state.upTokens.toFixed(4),
+        downTokens: state.downTokens.toFixed(4),
+        guaranteed: '$' + finalMetrics.guaranteed.toFixed(2),
+        totalSpent: '$' + finalMetrics.totalSpent.toFixed(2),
+        profit: '$' + finalMetrics.profit.toFixed(2),
+        profitPct: finalMetrics.profitPct.toFixed(2) + '%',
         locked: state.arbitrageLocked,
       },
-      state.arbitrageLocked ? 'ARBITRAGE LOCKED!' : 'Position hedged (not profitable)'
+      state.arbitrageLocked ? 'V2: ARBITRAGE LOCKED!' : 'V2: Position locked (check profit)'
     );
   }
 
@@ -475,17 +454,22 @@ async function main(): Promise<void> {
       crypto: config.crypto.toUpperCase(),
       totalCapital: '$' + config.totalCapital.toFixed(2),
       pools: {
-        initial: '$' + INITIAL_POOL.toFixed(2),
-        dca: '$' + DCA_POOL.toFixed(2) + ` (${config.dcaLevels} levels)`,
-        sniper: '$' + SNIPER_POOL.toFixed(2),
+        initial: '$' + INITIAL_POOL.toFixed(2) + ' (40%)',
+        dca: '$' + DCA_POOL.toFixed(2) + ' (40%)',
+        reserve: '$' + RESERVE_POOL.toFixed(2) + ' (20%)',
       },
-      entryRange: `${(ENTRY_MIN * 100).toFixed(0)}%-${(ENTRY_MAX * 100).toFixed(0)}%`,
-      dcaTrigger: (config.dcaTriggerPct * 100).toFixed(0) + '%',
-      arbitrageThreshold: config.arbitrageThreshold,
-      sniperWindow: config.sniperWindowSeconds + 's',
+      entry: {
+        maxTotalPrice: (config.maxTotalPrice * 100).toFixed(0) + '%',
+        minProfitPct: (config.minProfitPct * 100).toFixed(0) + '%',
+      },
+      rebalance: {
+        imbalanceThreshold: (config.imbalanceThreshold * 100).toFixed(0) + '%',
+        dcaAmount: '$' + config.dcaAmount.toFixed(0),
+      },
+      reserveWindow: config.reserveWindowSeconds + 's',
       dryRun: DRY_RUN,
     },
-    DRY_RUN ? '[DRY RUN] AVWA Strategy Started' : 'AVWA Strategy Started (LIVE)'
+    DRY_RUN ? '[DRY RUN] AVWA V2 Strategy Started' : 'AVWA V2 Strategy Started (LIVE)'
   );
 
   let lastSlug = '';
@@ -502,7 +486,7 @@ async function main(): Promise<void> {
         if (state && state.phase !== 'RESOLVED') {
           const metrics = getStateMetrics(state);
 
-          if (state.arbitrageLocked) {
+          if (state.arbitrageLocked || metrics.profit > 0) {
             cumulativeProfit = await updateSession(config.crypto, config, metrics.profit);
             logger.info(
               {
@@ -512,16 +496,17 @@ async function main(): Promise<void> {
                 profit: '$' + metrics.profit.toFixed(2),
                 cumulative: '$' + cumulativeProfit.toFixed(2),
               },
-              'Window closed - ARBITRAGE LOCKED'
+              'Window closed - POSITION RESOLVED'
             );
           } else if (metrics.totalSpent > 0) {
             logger.warn(
               {
                 slug: state.marketSlug,
                 spent: '$' + metrics.totalSpent.toFixed(2),
+                profit: '$' + metrics.profit.toFixed(2),
                 phase: state.phase,
               },
-              'Window closed - Position UNHEDGED'
+              'Window closed - Position UNBALANCED'
             );
           }
 
@@ -535,10 +520,10 @@ async function main(): Promise<void> {
         const existingState = await loadState(slug);
         if (existingState && existingState.status === 'ACTIVE') {
           state = existingState;
-          // Recalculate remaining pools from spent
-          state.initialPoolRemaining = INITIAL_POOL - (state.primarySpent > 0 && state.dcaLevel === 0 ? INITIAL_POOL : 0);
-          state.dcaPoolRemaining = DCA_POOL - state.dcaLevel * DCA_PER_LEVEL;
-          state.sniperPoolRemaining = SNIPER_POOL - state.hedgeSpent;
+          // Recalculate remaining pools
+          state.initialPoolRemaining = state.upSpent + state.downSpent > 0 ? 0 : INITIAL_POOL;
+          state.dcaPoolRemaining = DCA_POOL - (state.dcaLevel * config.dcaAmount);
+          state.reservePoolRemaining = RESERVE_POOL;
           logger.info({ slug, phase: state.phase }, 'Recovered existing position');
         }
 
@@ -550,7 +535,7 @@ async function main(): Promise<void> {
         state = initializeState(slug, config);
       }
 
-      // Skip if already resolved
+      // Skip if already resolved or locked
       if (state.phase === 'RESOLVED' || state.phase === 'LOCKED') {
         await sleep(1000);
         continue;
@@ -583,30 +568,26 @@ async function main(): Promise<void> {
           state = await handleWaitingPhase(state, upPrice, downPrice);
           break;
 
-        case 'ENTRY':
-          state = await handleEntryPhase(state, tradingClient, marketData.tokenIds, upPrice, downPrice);
+        case 'INITIAL':
+          state = await handleInitialPhase(state, tradingClient, marketData.tokenIds, upPrice, downPrice);
           break;
 
         case 'DCA':
           state = await handleDcaPhase(state, tradingClient, marketData.tokenIds, upPrice, downPrice, timeLeft);
           break;
 
-        case 'SNIPER_READY':
-          state = await handleSniperPhase(state, tradingClient, marketData.tokenIds, upPrice, downPrice, timeLeft);
-          break;
-
-        case 'LOCKING':
-          state = await handleLockingPhase(state, tradingClient, marketData.tokenIds, upPrice, downPrice);
+        case 'RESERVE':
+          state = await handleReservePhase(state, tradingClient, marketData.tokenIds, upPrice, downPrice, timeLeft);
           break;
       }
 
       // Save state if changed
-      if (state.phase !== prevPhase || state.primaryTokens > 0) {
+      if (state.phase !== prevPhase || state.upTokens > 0) {
         await saveState(state);
       }
 
       // Log status periodically
-      if (state.primaryTokens > 0 && Math.random() < 0.1) {
+      if ((state.upTokens > 0 || state.downTokens > 0) && Math.random() < 0.1) {
         const metrics = getStateMetrics(state);
         logger.info(
           {
@@ -614,10 +595,11 @@ async function main(): Promise<void> {
             timeLeft: timeLeft + 's',
             up: (upPrice * 100).toFixed(1) + '%',
             down: (downPrice * 100).toFixed(1) + '%',
-            primaryTok: state.primaryTokens.toFixed(2),
-            hedgeTok: state.hedgeTokens.toFixed(2),
+            upTok: state.upTokens.toFixed(2),
+            downTok: state.downTokens.toFixed(2),
             spent: '$' + metrics.totalSpent.toFixed(2),
-            dcaLevel: state.dcaLevel,
+            profit: '$' + metrics.profit.toFixed(2),
+            imbal: (metrics.imbalancePct * 100).toFixed(1) + '%',
           },
           'Status'
         );
@@ -635,7 +617,7 @@ async function main(): Promise<void> {
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-  logger.info('Shutting down AVWA...');
+  logger.info('Shutting down AVWA V2...');
   process.exit(0);
 });
 
